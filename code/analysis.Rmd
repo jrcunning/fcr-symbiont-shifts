@@ -1,0 +1,303 @@
+---
+title: "Florida Coral Symbiont Shifts"
+author: "Ross Cunning"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+project_root <- if (basename(getwd()) == "code") normalizePath("..") else normalizePath(".")
+knitr::opts_knit$set(root.dir = project_root)
+source(file.path(project_root, "R/symbiont_pipeline.R"))
+```
+
+# Goal
+
+Test whether symbiont composition changed across sampling eras while accounting
+for uneven sampling depth among eras.
+
+This cleaned analysis uses post-MED ITS2 sequence variants only. Type profiles,
+exploratory maps, old commented code, and temporary one-off exports were removed.
+The working composition scale is symbiont clade/genus: `A`, `B`, `C`, `D`, and
+`G`.
+
+# Required input files
+
+Copy these files from the previous project into the paths below.
+
+```{r required-files}
+required_files
+```
+
+```{r check-input-files}
+missing_files <- required_files |>
+  filter(!file.exists(path))
+
+if (nrow(missing_files) > 0) {
+  knitr::kable(missing_files, caption = "Files still needed before the analysis can run.")
+  knitr::knit_exit()
+}
+```
+
+# Load and clean data
+
+```{r load-data}
+metadata <- load_sample_metadata("metadata/decadalshifts_SST.xls")
+
+variant_runs <- load_variant_runs(c(
+  pawar = required_files$path[required_files$key == "pawar_variants"],
+  conn = required_files$path[required_files$key == "conn_variants"]
+))
+
+sample_clades <- prepare_sample_clade_composition(
+  metadata = metadata,
+  variants = variant_runs,
+  min_reads = 100
+)
+
+readr::write_csv(sample_clades, "data/processed/sample_clade_composition.csv")
+```
+
+```{r sample-summary}
+sample_summary <- sample_clades |>
+  count(collection_subregion, host_species_code, era, name = "n") |>
+  arrange(collection_subregion, host_species_code, era)
+
+readr::write_csv(sample_summary, "outputs/tables/sample_counts_by_era.csv")
+
+knitr::kable(sample_summary)
+```
+
+# Sampling depth diagnostics
+
+```{r depth-diagnostics}
+depth_summary <- sample_clades |>
+  group_by(collection_subregion, host_species_code, era) |>
+  summarize(
+    n = n(),
+    median_depth_ft = median(depth_ft, na.rm = TRUE),
+    q25_depth_ft = quantile(depth_ft, 0.25, na.rm = TRUE),
+    q75_depth_ft = quantile(depth_ft, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(depth_summary, "outputs/tables/depth_summary_by_era.csv")
+
+ggplot(sample_clades, aes(x = era, y = depth_ft)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.35, size = 1) +
+  facet_grid(collection_subregion ~ host_species_code, scales = "free_y") +
+  labs(x = NULL, y = "Collection depth (ft)") +
+  theme_classic()
+
+ggsave("outputs/figures/depth_by_era.png", width = 11, height = 7, dpi = 300)
+```
+
+# Depth-standardized composition
+
+For each subregion-by-species group, samples are binned by pooled depth. Within
+each era, samples are weighted so the era depth-bin distribution matches the
+pooled depth distribution for that subregion-by-species group. This preserves
+the observed samples while reducing bias from eras being sampled at different
+depths.
+
+Groups with fewer than `min_n` samples in an era are retained with `NA`
+composition for that era rather than silently dropped.
+
+```{r standardized-composition}
+min_n <- 4
+
+composition_std <- standardized_era_composition(
+  sample_clades,
+  min_n = min_n,
+  n_bins = 6
+)
+
+era_distances <- compare_eras(composition_std)
+
+readr::write_csv(composition_std, "data/processed/depth_standardized_composition.csv")
+readr::write_csv(era_distances, "outputs/tables/era_composition_distances.csv")
+
+composition_std |>
+  arrange(collection_subregion, host_species_code, era) |>
+  knitr::kable()
+```
+
+```{r composition-plot}
+composition_long <- composition_std |>
+  pivot_longer(all_of(clades), names_to = "clade", values_to = "proportion") |>
+  filter(!is.na(proportion))
+
+ggplot(composition_long, aes(x = era, y = proportion, fill = clade)) +
+  geom_col(width = 0.8, color = "white", linewidth = 0.2) +
+  facet_grid(collection_subregion ~ host_species_code) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = NULL, y = "Depth-standardized symbiont composition", fill = "Clade") +
+  theme_classic()
+
+ggsave("outputs/figures/depth_standardized_composition.png", width = 11, height = 7, dpi = 300)
+```
+
+```{r distance-plot}
+era_distances_plot <- era_distances |>
+  mutate(
+    contrast = factor(
+      paste(era1, "to", era2),
+      levels = c("2001-03 to 2019-21", "2019-21 to 2024", "2001-03 to 2024")
+    )
+  )
+
+ggplot(era_distances_plot, aes(x = contrast, y = Hellinger)) +
+  geom_col(width = 0.75) +
+  facet_grid(collection_subregion ~ host_species_code) +
+  labs(x = NULL, y = "Hellinger distance") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("outputs/figures/era_hellinger_distances.png", width = 11, height = 7, dpi = 300)
+```
+
+# Statistical test
+
+The primary test is a PERMANOVA on clade composition within each
+subregion-by-species group:
+
+`composition ~ era + depth_bin`
+
+This asks whether era explains composition after accounting for binned sampling
+depth. It is paired with the depth-standardized composition summaries above so
+the biological effect sizes are interpretable.
+
+```{r permanova}
+permanova_results <- permanova_by_group(
+  sample_clades,
+  min_n = min_n,
+  permutations = 999
+)
+
+readr::write_csv(permanova_results, "outputs/tables/permanova_by_subregion_species.csv")
+
+permanova_results |>
+  arrange(p_era) |>
+  knitr::kable()
+```
+
+# ITS2 shifts versus experimental shuffling
+
+The experimental shuffling coefficient table is joined by four-letter species
+code. Two comparisons are produced:
+
+1. era-to-era ITS2 composition distance versus experimental shuffling
+   coefficient;
+2. depth-standardized 2024 ITS2 clade-D proportion versus experimental clade-D
+   proportion.
+
+```{r experimental-comparison}
+experimental_shuffling <- load_experimental_shuffling(
+  required_files$path[required_files$key == "experimental_shuffling"]
+)
+
+experimental_comparison <- compare_its2_to_experimental(
+  composition = composition_std,
+  distances = era_distances,
+  experimental = experimental_shuffling
+)
+
+readr::write_csv(
+  experimental_comparison$distance,
+  "outputs/tables/its2_distances_vs_experimental_shuffling.csv"
+)
+readr::write_csv(
+  experimental_comparison$composition,
+  "outputs/tables/its2_2024_clade_d_vs_experimental_prop_d.csv"
+)
+readr::write_csv(
+  experimental_comparison$distance_correlations,
+  "outputs/tables/correlations_its2_distances_vs_experimental_shuffling.csv"
+)
+readr::write_csv(
+  experimental_comparison$composition_correlations,
+  "outputs/tables/correlations_its2_2024_clade_d_vs_experimental_prop_d.csv"
+)
+
+experimental_comparison$distance_correlations |>
+  arrange(collection_subregion, contrast) |>
+  knitr::kable()
+
+experimental_comparison$composition_correlations |>
+  arrange(collection_subregion) |>
+  knitr::kable()
+```
+
+```{r experimental-distance-plot}
+experimental_distance_plot <- experimental_comparison$distance |>
+  filter(
+    contrast == "2019-21 to 2024",
+    !is.na(mean_shuff_coef),
+    !is.na(Hellinger)
+  )
+
+ggplot(experimental_distance_plot, aes(x = mean_shuff_coef, y = Hellinger)) +
+  geom_point(aes(size = experimental_n), alpha = 0.75) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.6) +
+  geom_text(
+    aes(label = species_code),
+    nudge_y = 0.02,
+    check_overlap = TRUE,
+    size = 3
+  ) +
+  facet_wrap(~ collection_subregion) +
+  labs(
+    x = "Experimental shuffling coefficient",
+    y = "ITS2 Hellinger distance (2019-21 to 2024)",
+    size = "Experimental n"
+  ) +
+  theme_classic()
+
+ggsave("outputs/figures/its2_distance_vs_experimental_shuffling.png", width = 9, height = 5, dpi = 300)
+```
+
+```{r experimental-clade-d-plot}
+experimental_clade_d_plot <- experimental_comparison$composition |>
+  filter(!is.na(mean_prop_d), !is.na(its2_prop_d_2024))
+
+ggplot(experimental_clade_d_plot, aes(x = mean_prop_d, y = its2_prop_d_2024)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey55") +
+  geom_point(aes(size = experimental_n), alpha = 0.75) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.6) +
+  geom_text(
+    aes(label = species_code),
+    nudge_y = 0.02,
+    check_overlap = TRUE,
+    size = 3
+  ) +
+  facet_wrap(~ collection_subregion) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Experimental clade-D proportion",
+    y = "Depth-standardized 2024 ITS2 clade-D proportion",
+    size = "Experimental n"
+  ) +
+  theme_classic()
+
+ggsave("outputs/figures/its2_2024_clade_d_vs_experimental_prop_d.png", width = 9, height = 5, dpi = 300)
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

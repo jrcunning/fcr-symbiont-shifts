@@ -1,0 +1,205 @@
+---
+title: "Bleach 2023 Symbiont qPCR Exploration"
+author: "Ross Cunning"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+project_root <- if (basename(getwd()) == "code") normalizePath("..") else normalizePath(".")
+knitr::opts_knit$set(root.dir = project_root)
+
+library(janitor)
+library(readr)
+library(tidyverse)
+```
+
+# Goal
+
+Inspect and summarize `data/raw/bleach2023SymQpcr.rds`, a qPCR-based dataset
+with symbiont genus proportions in corals sampled during and after the 2023
+bleaching event.
+
+# Load and Audit
+
+```{r load-data}
+raw_qpcr <- readRDS("data/raw/bleach2023SymQpcr.rds") |>
+  as_tibble()
+
+glimpse(raw_qpcr)
+```
+
+```{r audit-summary}
+audit_summary <- tibble(
+  n_rows = nrow(raw_qpcr),
+  n_columns = ncol(raw_qpcr),
+  min_date = min(raw_qpcr$date, na.rm = TRUE),
+  max_date = max(raw_qpcr$date, na.rm = TRUE),
+  n_species = n_distinct(raw_qpcr$species),
+  n_sites = n_distinct(raw_qpcr$siteSimple),
+  n_timepoints = n_distinct(raw_qpcr$timepoint),
+  n_missing_status = sum(is.na(raw_qpcr$statusSimple)),
+  min_prop_sum = min(raw_qpcr$propA + raw_qpcr$propB + raw_qpcr$propC + raw_qpcr$propD),
+  max_prop_sum = max(raw_qpcr$propA + raw_qpcr$propB + raw_qpcr$propC + raw_qpcr$propD)
+)
+
+audit_summary |>
+  knitr::kable()
+```
+
+```{r category-counts}
+species_counts <- raw_qpcr |>
+  mutate(species_code = str_to_upper(species)) |>
+  count(species_code, sort = TRUE)
+
+site_counts <- raw_qpcr |>
+  count(siteSimple, sort = TRUE)
+
+timepoint_status_counts <- raw_qpcr |>
+  count(timepoint, statusSimple, sort = TRUE)
+
+species_counts |>
+  knitr::kable(caption = "Samples by species")
+
+site_counts |>
+  knitr::kable(caption = "Samples by site")
+
+timepoint_status_counts |>
+  knitr::kable(caption = "Samples by timepoint and bleaching status")
+```
+
+# Process Data
+
+```{r process-data}
+qpcr_samples <- raw_qpcr |>
+  clean_names() |>
+  mutate(
+    sample_id = row_number(),
+    species_code = str_to_upper(species),
+    status_simple = fct_na_value_to_level(status_simple, level = "Unscored"),
+    status_simple = factor(status_simple, levels = c("Healthy", "Bleached", "Recovering", "Unscored")),
+    timepoint = factor(timepoint, levels = c("bleach", "recovery")),
+    depth_ft = parse_number(as.character(depth_ft)),
+    prop_sum = prop_a + prop_b + prop_c + prop_d,
+    dominant_clade = c("A", "B", "C", "D")[max.col(as.matrix(pick(prop_a, prop_b, prop_c, prop_d)), ties.method = "first")]
+  ) |>
+  relocate(sample_id, species_code, date, timepoint, site_simple, status_simple)
+
+qpcr_long <- qpcr_samples |>
+  select(
+    sample_id, date, species_code, site_simple, status_simple, timepoint,
+    dhw, cummaxdhw, total_sym, dominant_clade,
+    prop_a, prop_b, prop_c, prop_d
+  ) |>
+  pivot_longer(
+    cols = starts_with("prop_"),
+    names_to = "clade",
+    values_to = "proportion"
+  ) |>
+  mutate(
+    clade = str_remove(clade, "^prop_") |>
+      str_to_upper() |>
+      factor(levels = c("A", "B", "C", "D"))
+  )
+
+readr::write_csv(qpcr_samples, "data/processed/bleach2023_qpcr_samples.csv")
+readr::write_csv(qpcr_long, "data/processed/bleach2023_qpcr_clade_long.csv")
+```
+
+# Exploratory Figures
+
+## Sample Coverage
+
+```{r sample-coverage-figure}
+species_plot <- species_counts |>
+  mutate(species_code = fct_reorder(species_code, n)) |>
+  ggplot(aes(x = n, y = species_code)) +
+  geom_col(fill = "grey35") +
+  labs(x = "Samples", y = NULL) +
+  theme_classic()
+
+timepoint_plot <- qpcr_samples |>
+  count(timepoint, status_simple) |>
+  ggplot(aes(x = timepoint, y = n, fill = status_simple)) +
+  geom_col(width = 0.75) +
+  labs(x = NULL, y = "Samples", fill = "Status") +
+  theme_classic()
+
+species_plot
+timepoint_plot
+
+ggsave("outputs/figures/bleach2023_qpcr_species_counts.png", species_plot, width = 7, height = 6, dpi = 300)
+ggsave("outputs/figures/bleach2023_qpcr_timepoint_status_counts.png", timepoint_plot, width = 7, height = 5, dpi = 300)
+```
+
+## Symbiont Composition by Species and Timepoint
+
+```{r composition-by-species-timepoint}
+composition_species_timepoint <- qpcr_long |>
+  group_by(species_code, timepoint, clade) |>
+  filter(status_simple == "Healthy") %>%
+  summarize(
+    n = n_distinct(sample_id),
+    mean_proportion = mean(proportion),
+    se_proportion = sd(proportion) / sqrt(n()),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  composition_species_timepoint,
+  "data/processed/bleach2023_qpcr_composition_by_species_timepoint.csv"
+)
+
+composition_plot <- composition_species_timepoint |>
+  filter(species_code %in% species_counts$species_code[species_counts$n >= 15]) |>
+  mutate(species_code = fct_reorder(species_code, mean_proportion, .fun = sum)) |>
+  ggplot(aes(x = timepoint, y = mean_proportion, fill = clade)) +
+  geom_col(width = 0.75, color = "white", linewidth = 0.2) +
+  facet_wrap(~ species_code) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = NULL, y = "Mean symbiont proportion", fill = "Clade") +
+  theme_classic()
+
+composition_plot
+
+ggsave("outputs/figures/bleach2023_qpcr_composition_by_species_timepoint.png", composition_plot, width = 11, height = 7, dpi = 300)
+```
+
+## Clade D Across Heat Stress and Bleaching Status
+
+```{r clade-d-dhw-status}
+clade_d_plot <- qpcr_samples |>
+  filter(species_code %in% species_counts$species_code[species_counts$n >= 15]) |>
+  ggplot(aes(x = cummaxdhw, y = prop_d, color = status_simple)) +
+  geom_point(alpha = 0.55, size = 1.5) +
+  geom_smooth(aes(group = 1), method = "lm", se = TRUE, linewidth = 0.6, color = "grey25") +
+  facet_wrap(~ species_code) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Cumulative maximum DHW",
+    y = "Clade D proportion",
+    color = "Status"
+  ) +
+  theme_classic()
+
+clade_d_plot
+
+ggsave("outputs/figures/bleach2023_qpcr_clade_d_by_dhw_status.png", clade_d_plot, width = 11, height = 7, dpi = 300)
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
