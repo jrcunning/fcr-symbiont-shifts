@@ -20,7 +20,7 @@ Copy these files into the project before knitting `code/analysis.Rmd`:
 
 - `metadata/decadalshifts_SST.xls`
 - `data/raw/20240723T194127_Pawar_Run /post_med_seqs/500_20240730T092802_DBV_20240730T195050.seqs.absolute.abund_and_meta.txt`
-- `data/raw/20250702T202717_Conn_Run/post_med_seqs/606_20250710T083602_DBV_20250712T034645.seqs.absolute.abund_and_meta.txt`
+- `data/raw/20250717T180136_conntr1/post_med_seqs/610_20250905T171203_DBV_20250910T163211.seqs.absolute.abund_and_meta.txt`
 - `data/raw/experimental_shuffling_coef.csv`
 - `data/raw/bleach2023SymQpcr.rds` for the separate qPCR exploration notebook.
 

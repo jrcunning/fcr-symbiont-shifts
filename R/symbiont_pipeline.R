@@ -11,7 +11,7 @@ required_files <- tribble(
   ~key, ~path, ~description,
   "metadata", "metadata/decadalshifts_SST.xls", "Sample metadata with sample_name, collection_date, collection_region, collection_subregion, collection_site, collection_depth_ft, host_genus, and host_species.",
   "pawar_variants", "data/raw/20240723T194127_Pawar_Run /post_med_seqs/500_20240730T092802_DBV_20240730T195050.seqs.absolute.abund_and_meta.txt", "SymPortal post-MED sequence absolute abundance table for the Pawar run.",
-  "conn_variants", "data/raw/20250702T202717_Conn_Run/post_med_seqs/606_20250710T083602_DBV_20250712T034645.seqs.absolute.abund_and_meta.txt", "SymPortal post-MED sequence absolute abundance table for the Conn run.",
+  "conn_variants", "data/raw/20250717T180136_conntr1/post_med_seqs/610_20250905T171203_DBV_20250910T163211.seqs.absolute.abund_and_meta.txt", "SymPortal post-MED sequence absolute abundance table for the Conn Dry Tortugas run.",
   "experimental_shuffling", "data/raw/experimental_shuffling_coef.csv", "Experimental shuffling coefficients and experimental clade-D summaries by coral species."
 )
 
@@ -101,6 +101,54 @@ load_experimental_shuffling <- function(path) {
       experimental_n = n
     ) |>
     mutate(species_code = str_to_upper(species_code))
+}
+
+audit_sample_retention <- function(metadata, variants, min_reads = 100, clade_cols = clades) {
+  sample_reads <- variants$abundance |>
+    group_by(sample_name, run_id) |>
+    summarize(post_med_reads = sum(count, na.rm = TRUE), .groups = "drop")
+
+  clade_reads <- variants$abundance |>
+    left_join(variants$taxonomy, by = "DIV") |>
+    filter(clade %in% clade_cols) |>
+    group_by(sample_name, run_id) |>
+    summarize(target_clade_reads = sum(count, na.rm = TRUE), .groups = "drop")
+
+  audited_samples <- variants$samples |>
+    distinct(sample_name, run_id, .keep_all = TRUE) |>
+    select(sample_name, run_id) |>
+    left_join(sample_reads, by = c("sample_name", "run_id")) |>
+    left_join(clade_reads, by = c("sample_name", "run_id")) |>
+    left_join(
+      metadata |>
+        select(sample_name, collection_region, collection_subregion, era, host_species_code),
+      by = "sample_name"
+    ) |>
+    mutate(
+      post_med_reads = replace_na(post_med_reads, 0),
+      target_clade_reads = replace_na(target_clade_reads, 0),
+      retention_status = case_when(
+        is.na(collection_region) ~ "dropped: metadata unmatched",
+        post_med_reads < min_reads ~ "dropped: post-MED reads < threshold",
+        collection_region != "FL" ~ "dropped: non-Florida sample",
+        is.na(era) ~ "dropped: missing era",
+        target_clade_reads <= 0 ~ "dropped: zero target clade reads",
+        TRUE ~ "kept"
+      )
+    )
+
+  list(
+    stage_counts = audited_samples |>
+      count(run_id, retention_status, collection_region, collection_subregion, era, name = "n") |>
+      arrange(run_id, retention_status, collection_region, collection_subregion, era),
+    dropped_samples = audited_samples |>
+      filter(retention_status != "kept") |>
+      arrange(run_id, retention_status, sample_name),
+    duplicate_sample_names = audited_samples |>
+      count(sample_name, name = "n_runs") |>
+      filter(n_runs > 1) |>
+      arrange(desc(n_runs), sample_name)
+  )
 }
 
 prepare_sample_clade_composition <- function(metadata, variants, min_reads = 100) {
@@ -244,19 +292,27 @@ distance_correlation_summary <- function(df) {
 }
 
 standardized_era_composition <- function(data, group_cols = c("collection_subregion", "host_species_code"),
-                                         min_n = 4, n_bins = 6, clade_cols = clades) {
+                                         min_n = 4, n_bins = 6, clade_cols = clades,
+                                         no_depth_standardization_subregions = "Dry Tortugas") {
   data |>
-    filter(!is.na(depth_ft)) |>
     group_by(across(all_of(group_cols))) |>
     group_modify(\(.x, .y) {
-      df <- .x |>
-        mutate(depth_bin = make_depth_bins(depth_ft, n_bins = n_bins))
+      df <- .x
+      subregion <- if ("collection_subregion" %in% names(.y)) .y$collection_subregion else NA_character_
+      skip_depth_standardization <- !is.na(subregion) && subregion %in% no_depth_standardization_subregions
+      has_complete_depth <- all(!is.na(df$depth_ft))
+      depth_bins <- if (has_complete_depth) make_depth_bins(df$depth_ft, n_bins = n_bins) else factor(rep(NA_character_, nrow(df)))
+      use_depth_standardization <- !skip_depth_standardization && has_complete_depth && !all(is.na(depth_bins))
 
-      if (all(is.na(df$depth_bin))) {
-        return(tibble())
+      if (use_depth_standardization) {
+        df <- mutate(df, depth_bin = depth_bins)
+        target_bins <- df$depth_bin
+        standardization_method <- "Depth-standardized"
+      } else if (skip_depth_standardization) {
+        standardization_method <- "Not depth-standardized: Dry Tortugas"
+      } else {
+        standardization_method <- "Not depth-standardized"
       }
-
-      target_bins <- df$depth_bin
 
       map_dfr(eras, \(era_i) {
         era_df <- filter(df, era == era_i)
@@ -264,11 +320,19 @@ standardized_era_composition <- function(data, group_cols = c("collection_subreg
 
         if (n_samples < min_n) {
           comp <- set_names(rep(NA_real_, length(clade_cols)), clade_cols)
-        } else {
+        } else if (use_depth_standardization) {
           comp <- weighted_composition(era_df, depth_weights(era_df, target_bins), clade_cols)
+        } else {
+          comp <- weighted_composition(era_df, clade_cols = clade_cols)
         }
 
-        tibble(era = era_i, n = n_samples, depth_standardized = TRUE, !!!as.list(comp))
+        tibble(
+          era = era_i,
+          n = n_samples,
+          depth_standardized = use_depth_standardization,
+          standardization_method = standardization_method,
+          !!!as.list(comp)
+        )
       })
     }) |>
     ungroup() |>
@@ -293,9 +357,21 @@ compare_eras <- function(composition, clade_cols = clades) {
         p2 <- filter(.x, era == e2)
         n1 <- if (nrow(p1) == 1) p1$n else NA_integer_
         n2 <- if (nrow(p2) == 1) p2$n else NA_integer_
+        depth_standardized <- if (nrow(p1) == 1) p1$depth_standardized else NA
+        standardization_method <- if (nrow(p1) == 1) p1$standardization_method else NA_character_
 
         if (nrow(p1) != 1 || nrow(p2) != 1 || anyNA(select(p1, all_of(clade_cols))) || anyNA(select(p2, all_of(clade_cols)))) {
-          return(tibble(era1 = e1, era2 = e2, n1 = n1, n2 = n2, TV = NA_real_, Hellinger = NA_real_, JSD = NA_real_))
+          return(tibble(
+            era1 = e1,
+            era2 = e2,
+            n1 = n1,
+            n2 = n2,
+            depth_standardized = depth_standardized,
+            standardization_method = standardization_method,
+            TV = NA_real_,
+            Hellinger = NA_real_,
+            JSD = NA_real_
+          ))
         }
 
         v1 <- as.numeric(select(p1, all_of(clade_cols)))
@@ -306,6 +382,8 @@ compare_eras <- function(composition, clade_cols = clades) {
           era2 = e2,
           n1 = n1,
           n2 = n2,
+          depth_standardized = depth_standardized,
+          standardization_method = standardization_method,
           TV = total_variation_distance(v1, v2),
           Hellinger = hellinger_distance(v1, v2),
           JSD = jensen_shannon_distance(v1, v2)
@@ -363,25 +441,41 @@ compare_its2_to_experimental <- function(composition, distances, experimental) {
 }
 
 permanova_by_group <- function(data, group_cols = c("collection_subregion", "host_species_code"),
-                               min_n = 4, clade_cols = clades, permutations = 999) {
+                               min_n = 4, clade_cols = clades, permutations = 999,
+                               no_depth_adjustment_subregions = "Dry Tortugas") {
   data |>
-    filter(!is.na(depth_ft)) |>
     group_by(across(all_of(group_cols))) |>
     group_modify(\(.x, .y) {
-      df <- .x |>
-        mutate(depth_bin = make_depth_bins(depth_ft)) |>
-        filter(!is.na(depth_bin))
+      df <- .x
+      subregion <- if ("collection_subregion" %in% names(.y)) .y$collection_subregion else NA_character_
+      skip_depth_adjustment <- !is.na(subregion) && subregion %in% no_depth_adjustment_subregions
+      has_complete_depth <- all(!is.na(df$depth_ft))
+      depth_bins <- if (has_complete_depth) make_depth_bins(df$depth_ft) else factor(rep(NA_character_, nrow(df)))
+      use_depth_adjustment <- !skip_depth_adjustment && has_complete_depth && !all(is.na(depth_bins)) && n_distinct(depth_bins) > 1
+
+      if (use_depth_adjustment) {
+        df <- mutate(df, depth_bin = depth_bins)
+      }
 
       era_counts <- df |>
         count(era) |>
         filter(n >= min_n)
 
       if (nrow(era_counts) < 2) {
-        return(tibble(n = nrow(df), eras_tested = nrow(era_counts), r2_era = NA_real_, p_era = NA_real_))
+        return(tibble(
+          n = nrow(df),
+          eras_tested = nrow(era_counts),
+          depth_adjusted = use_depth_adjustment,
+          test_formula = if_else(use_depth_adjustment, "composition ~ era + depth_bin", "composition ~ era"),
+          r2_era = NA_real_,
+          p_era = NA_real_,
+          r2_depth_bin = NA_real_,
+          p_depth_bin = NA_real_
+        ))
       }
 
       df <- filter(df, era %in% era_counts$era)
-      if (n_distinct(df$depth_bin) > 1) {
+      if (use_depth_adjustment) {
         fit <- vegan::adonis2(
           as.matrix(select(df, all_of(clade_cols))) ~ era + depth_bin,
           data = df,
@@ -406,6 +500,8 @@ permanova_by_group <- function(data, group_cols = c("collection_subregion", "hos
       tibble(
         n = nrow(df),
         eras_tested = n_distinct(df$era),
+        depth_adjusted = use_depth_adjustment,
+        test_formula = if_else(use_depth_adjustment, "composition ~ era + depth_bin", "composition ~ era"),
         r2_era = fit$R2[1],
         p_era = fit$`Pr(>F)`[1],
         r2_depth_bin = r2_depth_bin,

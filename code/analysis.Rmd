@@ -66,10 +66,26 @@ sample_clades <- prepare_sample_clade_composition(
   min_reads = 100
 )
 
+sample_retention <- audit_sample_retention(
+  metadata = metadata,
+  variants = variant_runs,
+  min_reads = 100
+)
+
 readr::write_csv(sample_clades, "data/processed/sample_clade_composition.csv")
+readr::write_csv(sample_retention$stage_counts, "outputs/tables/sample_retention_audit.csv")
+readr::write_csv(sample_retention$dropped_samples, "outputs/tables/dropped_samples.csv")
 ```
 
 ```{r sample-summary}
+sample_retention$stage_counts |>
+  knitr::kable(caption = "Sample retention audit")
+
+if (nrow(sample_retention$duplicate_sample_names) > 0) {
+  sample_retention$duplicate_sample_names |>
+    knitr::kable(caption = "Sample names present in more than one imported run")
+}
+
 sample_summary <- sample_clades |>
   count(collection_subregion, host_species_code, era, name = "n") |>
   arrange(collection_subregion, host_species_code, era)
@@ -104,13 +120,19 @@ ggplot(sample_clades, aes(x = era, y = depth_ft)) +
 ggsave("outputs/figures/depth_by_era.png", width = 11, height = 7, dpi = 300)
 ```
 
-# Depth-standardized composition
+# Symbiont composition
 
 For each subregion-by-species group, samples are binned by pooled depth. Within
 each era, samples are weighted so the era depth-bin distribution matches the
 pooled depth distribution for that subregion-by-species group. This preserves
 the observed samples while reducing bias from eras being sampled at different
 depths.
+
+Dry Tortugas samples are not depth-standardized because one era lacks depth
+information; for cross-era Dry Tortugas comparisons, all eras are therefore
+kept on the same non-depth-standardized scale. Other subregion-by-species groups
+without usable depth information are also kept and reported as
+non-depth-standardized mean composition.
 
 Groups with fewer than `min_n` samples in an era are retained with `NA`
 composition for that era rather than silently dropped.
@@ -121,7 +143,8 @@ min_n <- 4
 composition_std <- standardized_era_composition(
   sample_clades,
   min_n = min_n,
-  n_bins = 6
+  n_bins = 6,
+  no_depth_standardization_subregions = "Dry Tortugas"
 )
 
 era_distances <- compare_eras(composition_std)
@@ -141,9 +164,9 @@ composition_long <- composition_std |>
 
 ggplot(composition_long, aes(x = era, y = proportion, fill = clade)) +
   geom_col(width = 0.8, color = "white", linewidth = 0.2) +
-  facet_grid(collection_subregion ~ host_species_code) +
+  facet_grid(collection_subregion + standardization_method ~ host_species_code) +
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-  labs(x = NULL, y = "Depth-standardized symbiont composition", fill = "Clade") +
+  labs(x = NULL, y = "Symbiont composition", fill = "Clade") +
   theme_classic()
 
 ggsave("outputs/figures/depth_standardized_composition.png", width = 11, height = 7, dpi = 300)
@@ -171,19 +194,23 @@ ggsave("outputs/figures/era_hellinger_distances.png", width = 11, height = 7, dp
 # Statistical test
 
 The primary test is a PERMANOVA on clade composition within each
-subregion-by-species group:
+subregion-by-species group. Groups with usable depth data are tested as:
 
 `composition ~ era + depth_bin`
 
-This asks whether era explains composition after accounting for binned sampling
-depth. It is paired with the depth-standardized composition summaries above so
-the biological effect sizes are interpretable.
+Groups without usable depth data are kept and tested as:
+
+`composition ~ era`
+
+These tests are paired with the composition summaries above so the biological
+effect sizes are interpretable.
 
 ```{r permanova}
 permanova_results <- permanova_by_group(
   sample_clades,
   min_n = min_n,
-  permutations = 999
+  permutations = 999,
+  no_depth_adjustment_subregions = "Dry Tortugas"
 )
 
 readr::write_csv(permanova_results, "outputs/tables/permanova_by_subregion_species.csv")
