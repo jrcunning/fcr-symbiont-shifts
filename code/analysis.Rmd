@@ -323,6 +323,170 @@ ggplot(experimental_clade_d_plot, aes(x = mean_prop_d, y = its2_prop_d_2024)) +
 ggsave("outputs/figures/its2_2024_clade_d_vs_experimental_prop_d.png", width = 9, height = 5, dpi = 300)
 ```
 
+# Across-region synthesis
+
+This section combines Upper Keys and Dry Tortugas into one species-level view.
+The inputs are the region-level compositions above: Upper Keys is
+depth-standardized where possible, and Dry Tortugas is treated as
+design-standardized by repeated site sampling and therefore not
+depth-standardized.
+
+Regions are weighted equally when both regions are available for a species and
+era. This is intended as an across-region biological synthesis rather than a
+sample-size-weighted summary dominated by the region with more samples.
+
+```{r across-region-composition}
+across_region_composition <- combine_regions_by_species(
+  composition_std,
+  regions = c("Upper Keys", "Dry Tortugas"),
+  region_weighting = "equal"
+)
+
+across_region_distances <- compare_eras_by_species(across_region_composition)
+
+readr::write_csv(
+  across_region_composition,
+  "data/processed/across_region_species_composition.csv"
+)
+readr::write_csv(
+  across_region_distances,
+  "outputs/tables/across_region_species_era_distances.csv"
+)
+
+across_region_composition |>
+  arrange(host_species_code, era) |>
+  knitr::kable()
+```
+
+```{r across-region-composition-plot}
+across_region_composition_long <- across_region_composition |>
+  pivot_longer(all_of(clades), names_to = "clade", values_to = "proportion") |>
+  filter(!is.na(proportion))
+
+across_region_composition_plot <- ggplot(
+  across_region_composition_long,
+  aes(x = era, y = proportion, fill = clade)
+) +
+  geom_col(width = 0.8, color = "white", linewidth = 0.2) +
+  facet_wrap(~ host_species_code) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = NULL,
+    y = "Across-region symbiont composition",
+    fill = "Clade"
+  ) +
+  theme_classic()
+
+across_region_composition_plot
+
+ggsave(
+  "outputs/figures/across_region_species_composition.png",
+  across_region_composition_plot,
+  width = 11,
+  height = 7,
+  dpi = 300
+)
+```
+
+```{r across-region-experimental-comparison}
+across_region_experimental <- compare_across_region_to_experimental(
+  composition = across_region_composition,
+  distances = across_region_distances,
+  experimental = experimental_shuffling
+)
+
+readr::write_csv(
+  across_region_experimental$distance,
+  "outputs/tables/across_region_its2_distances_vs_experimental_shuffling.csv"
+)
+readr::write_csv(
+  across_region_experimental$composition,
+  "outputs/tables/across_region_its2_2024_clade_d_vs_experimental_prop_d.csv"
+)
+readr::write_csv(
+  across_region_experimental$distance_correlations,
+  "outputs/tables/across_region_correlations_its2_distances_vs_experimental_shuffling.csv"
+)
+readr::write_csv(
+  across_region_experimental$composition_correlations,
+  "outputs/tables/across_region_correlations_its2_2024_clade_d_vs_experimental_prop_d.csv"
+)
+
+across_region_experimental$distance_correlations |>
+  arrange(contrast) |>
+  knitr::kable()
+
+across_region_experimental$composition_correlations |>
+  knitr::kable()
+```
+
+```{r across-region-distance-experimental-plot}
+across_region_distance_plot <- across_region_experimental$distance |>
+  filter(
+    contrast == "2019-21 to 2024",
+    !is.na(mean_shuff_coef),
+    !is.na(Hellinger)
+  )
+
+ggplot(across_region_distance_plot, aes(x = mean_shuff_coef, y = Hellinger)) +
+  geom_point(aes(size = experimental_n), alpha = 0.75) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.6) +
+  geom_text(
+    aes(label = species_code),
+    nudge_y = 0.02,
+    check_overlap = TRUE,
+    size = 3
+  ) +
+  labs(
+    x = "Experimental shuffling coefficient",
+    y = "Across-region ITS2 Hellinger distance (2019-21 to 2024)",
+    size = "Experimental n"
+  ) +
+  theme_classic() +
+  ggpubr::stat_cor()
+
+ggsave(
+  "outputs/figures/across_region_its2_distance_vs_experimental_shuffling.png",
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+```{r across-region-clade-d-experimental-plot}
+across_region_clade_d_plot <- across_region_experimental$composition |>
+  filter(!is.na(mean_prop_d), !is.na(its2_prop_d_2024))
+
+ggplot(across_region_clade_d_plot, aes(x = mean_prop_d, y = its2_prop_d_2024)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey55") +
+  geom_point(aes(size = experimental_n), alpha = 0.75) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.6) +
+  geom_text(
+    aes(label = species_code),
+    nudge_y = 0.02,
+    check_overlap = TRUE,
+    size = 3
+  ) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Experimental clade-D proportion",
+    y = "Across-region 2024 ITS2 clade-D proportion",
+    size = "Experimental n"
+  ) +
+  theme_classic()
+
+ggsave(
+  "outputs/figures/across_region_its2_2024_clade_d_vs_experimental_prop_d.png",
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+
+
 # Session info
 
 ```{r session-info}

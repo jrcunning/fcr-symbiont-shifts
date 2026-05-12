@@ -440,6 +440,215 @@ compare_its2_to_experimental <- function(composition, distances, experimental) {
   )
 }
 
+combine_regions_by_species <- function(composition, regions = c("Upper Keys", "Dry Tortugas"),
+                                       clade_cols = clades, region_weighting = c("equal", "sample_n")) {
+  region_weighting <- match.arg(region_weighting)
+
+  composition |>
+    filter(collection_subregion %in% regions) |>
+    filter(if_any(all_of(clade_cols), ~ !is.na(.x))) |>
+    group_by(host_species_code, era) |>
+    group_modify(\(.x, .y) {
+      if (region_weighting == "equal") {
+        weights <- rep(1, nrow(.x))
+      } else {
+        weights <- .x$n
+      }
+
+      weights <- weights / sum(weights, na.rm = TRUE)
+      x <- as.matrix(select(.x, all_of(clade_cols)))
+      combined <- colSums(x * weights, na.rm = TRUE)
+      combined <- combined / sum(combined)
+
+      tibble(
+        n_total = sum(.x$n, na.rm = TRUE),
+        n_regions = n_distinct(.x$collection_subregion),
+        regions_included = str_c(sort(unique(.x$collection_subregion)), collapse = "; "),
+        region_weighting = region_weighting,
+        standardization_context = str_c(sort(unique(.x$standardization_method)), collapse = "; "),
+        !!!as.list(set_names(combined, clade_cols))
+      )
+    }) |>
+    ungroup() |>
+    mutate(era = factor(era, levels = eras))
+}
+
+compare_eras_by_species <- function(composition, clade_cols = clades) {
+  contrasts <- tribble(
+    ~era1, ~era2,
+    "2001-03", "2019-21",
+    "2019-21", "2024",
+    "2001-03", "2024"
+  )
+
+  composition |>
+    group_by(host_species_code) |>
+    group_modify(\(.x, .y) {
+      map_dfr(seq_len(nrow(contrasts)), \(i) {
+        e1 <- contrasts$era1[i]
+        e2 <- contrasts$era2[i]
+        p1 <- filter(.x, era == e1)
+        p2 <- filter(.x, era == e2)
+        n1 <- if (nrow(p1) == 1) p1$n_total else NA_integer_
+        n2 <- if (nrow(p2) == 1) p2$n_total else NA_integer_
+        regions_era1 <- if (nrow(p1) == 1) p1$regions_included else NA_character_
+        regions_era2 <- if (nrow(p2) == 1) p2$regions_included else NA_character_
+
+        if (nrow(p1) != 1 || nrow(p2) != 1 || anyNA(select(p1, all_of(clade_cols))) || anyNA(select(p2, all_of(clade_cols)))) {
+          return(tibble(
+            era1 = e1,
+            era2 = e2,
+            n1 = n1,
+            n2 = n2,
+            regions_era1 = regions_era1,
+            regions_era2 = regions_era2,
+            TV = NA_real_,
+            Hellinger = NA_real_,
+            JSD = NA_real_
+          ))
+        }
+
+        v1 <- as.numeric(select(p1, all_of(clade_cols)))
+        v2 <- as.numeric(select(p2, all_of(clade_cols)))
+
+        tibble(
+          era1 = e1,
+          era2 = e2,
+          n1 = n1,
+          n2 = n2,
+          regions_era1 = regions_era1,
+          regions_era2 = regions_era2,
+          TV = total_variation_distance(v1, v2),
+          Hellinger = hellinger_distance(v1, v2),
+          JSD = jensen_shannon_distance(v1, v2)
+        )
+      })
+    }) |>
+    ungroup()
+}
+
+compare_across_region_to_experimental <- function(composition, distances, experimental) {
+  composition_2024 <- composition |>
+    filter(era == "2024") |>
+    select(
+      species_code = host_species_code,
+      n_its2_2024 = n_total,
+      n_regions_2024 = n_regions,
+      regions_2024 = regions_included,
+      its2_prop_d_2024 = D
+    )
+
+  distance_joined <- distances |>
+    mutate(
+      species_code = host_species_code,
+      contrast = paste(era1, "to", era2)
+    ) |>
+    left_join(experimental, by = "species_code")
+
+  composition_joined <- composition_2024 |>
+    left_join(experimental, by = "species_code")
+
+  distance_correlations <- distance_joined |>
+    filter(!is.na(mean_shuff_coef), !is.na(Hellinger)) |>
+    group_by(contrast) |>
+    group_modify(\(.x, .y) distance_correlation_summary(.x)) |>
+    ungroup()
+
+  composition_correlations <- composition_joined |>
+    filter(!is.na(mean_prop_d), !is.na(its2_prop_d_2024))
+
+  composition_correlations <- correlation_summary(
+    composition_correlations$its2_prop_d_2024,
+    composition_correlations$mean_prop_d,
+    "cor_its2_d_experimental_d",
+    "p_its2_d_experimental_d"
+  )
+
+  list(
+    distance = distance_joined,
+    composition = composition_joined,
+    distance_correlations = distance_correlations,
+    composition_correlations = composition_correlations
+  )
+}
+
+partial_pool_all_region_composition <- function(sample_data,
+                                                regions = c("Upper Keys", "Dry Tortugas", "Marquesas"),
+                                                clade_cols = clades) {
+  model_data <- sample_data |>
+    filter(collection_subregion %in% regions, era %in% eras) |>
+    mutate(
+      host_species_code = factor(host_species_code),
+      collection_subregion = factor(collection_subregion, levels = regions),
+      era = factor(era, levels = eras),
+      era_num = as.numeric(era) - 1
+    )
+
+  observed_species_regions <- model_data |>
+    distinct(host_species_code, collection_subregion)
+
+  prediction_grid <- observed_species_regions |>
+    tidyr::expand_grid(era = factor(eras, levels = eras)) |>
+    mutate(
+      host_species_code = factor(host_species_code, levels = levels(model_data$host_species_code)),
+      collection_subregion = factor(collection_subregion, levels = levels(model_data$collection_subregion)),
+      era_num = as.numeric(era) - 1
+    )
+
+  predict_one_clade <- function(clade) {
+    dat <- model_data |>
+      mutate(
+        clade_reads = pmin(post_med_reads, pmax(0, round(.data[[clade]] * post_med_reads))),
+        other_reads = post_med_reads - clade_reads
+      )
+
+    fit <- mgcv::gam(
+      cbind(clade_reads, other_reads) ~
+        era_num +
+        collection_subregion +
+        s(host_species_code, bs = "re") +
+        s(host_species_code, by = era_num, bs = "re"),
+      data = dat,
+      family = quasibinomial(),
+      method = "REML"
+    )
+
+    prediction_grid |>
+      mutate(!!clade := as.numeric(predict(fit, newdata = prediction_grid, type = "response"))) |>
+      select(host_species_code, collection_subregion, era, all_of(clade))
+  }
+
+  predicted_region_composition <- map(clade_cols, predict_one_clade) |>
+    reduce(left_join, by = c("host_species_code", "collection_subregion", "era")) |>
+    mutate(
+      across(all_of(clade_cols), ~ replace_na(.x, 0)),
+      pred_sum = rowSums(across(all_of(clade_cols)))
+    ) |>
+    filter(pred_sum > 0) |>
+    mutate(across(all_of(clade_cols), ~ .x / pred_sum)) |>
+    select(-pred_sum)
+
+  observed_counts <- model_data |>
+    count(host_species_code, era, name = "n_total")
+
+  predicted_region_composition |>
+    group_by(host_species_code, era) |>
+    summarize(
+      n_regions = n_distinct(collection_subregion),
+      regions_included = str_c(sort(unique(as.character(collection_subregion))), collapse = "; "),
+      region_weighting = "partial pooling; equal observed-region prediction weights",
+      standardization_context = "GAM one-vs-rest clade models with species random intercepts/slopes",
+      across(all_of(clade_cols), mean),
+      .groups = "drop"
+    ) |>
+    left_join(observed_counts, by = c("host_species_code", "era")) |>
+    mutate(
+      n_total = replace_na(n_total, 0L),
+      era = factor(era, levels = eras)
+    ) |>
+    relocate(n_total, .after = era)
+}
+
 permanova_by_group <- function(data, group_cols = c("collection_subregion", "host_species_code"),
                                min_n = 4, clade_cols = clades, permutations = 999,
                                no_depth_adjustment_subregions = "Dry Tortugas") {
