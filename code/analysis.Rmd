@@ -95,6 +95,27 @@ readr::write_csv(sample_summary, "outputs/tables/sample_counts_by_era.csv")
 knitr::kable(sample_summary)
 ```
 
+```{r drto-site-species-sample-summary}
+drto_site_species_summary <- sample_clades |>
+  filter(collection_subregion == "Dry Tortugas") |>
+  count(
+    collection_subregion, collection_site, host_species_code,
+    host_genus, host_species,
+    name = "n_samples"
+  ) |>
+  arrange(collection_site, host_species_code)
+
+readr::write_csv(
+  drto_site_species_summary,
+  "outputs/tables/drto_its2_sample_counts_by_site_species.csv"
+)
+
+knitr::kable(
+  drto_site_species_summary,
+  caption = "Dry Tortugas ITS2 samples retained for the main analysis by site and species"
+)
+```
+
 # Sampling depth diagnostics
 
 ```{r depth-diagnostics}
