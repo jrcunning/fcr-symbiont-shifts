@@ -99,7 +99,7 @@ knitr::kable(sample_summary)
 drto_site_species_summary <- sample_clades |>
   filter(collection_subregion == "Dry Tortugas") |>
   count(
-    collection_subregion, collection_site, host_species_code,
+    collection_subregion, collection_site, host_species_code, era,
     host_genus, host_species,
     name = "n_samples"
   ) |>
