@@ -631,6 +631,539 @@ standardized_shift_plot
 ggsave("outputs/figures/site_depth_standardized_hellinger_shifts_by_species.png", standardized_shift_plot, width = 11, height = 6.5, dpi = 300)
 ```
 
+# Field-observed composition take-homes
+
+Before comparing field shifts to experimental shuffling, the table and figure
+below summarize the field observations on their own. These species-level values
+use the same standardized composition estimates as above: Upper Keys estimates
+are standardized across site and depth, Dry Tortugas estimates are standardized
+across site, and species with both subregions available are averaged across
+subregions equally.
+
+```{r field-observed-shift-summary}
+field_observed_shift_summary <- across_region_composition |>
+  filter(era %in% c("2019-21", "2024")) |>
+  mutate(era_key = if_else(era == "2019-21", "era_2019_21", "era_2024")) |>
+  select(
+    host_species_code,
+    era_key,
+    n_total,
+    n_regions,
+    regions_included,
+    durusdinium = D
+  ) |>
+  pivot_wider(
+    names_from = era_key,
+    values_from = c(durusdinium, n_total, n_regions, regions_included),
+    names_sep = "__"
+  ) |>
+  left_join(
+    across_region_distances |>
+      filter(era1 == "2019-21", era2 == "2024") |>
+      select(host_species_code, hellinger_2019_21_to_2024 = Hellinger),
+    by = "host_species_code"
+  ) |>
+  filter(
+    !is.na(durusdinium__era_2019_21),
+    !is.na(durusdinium__era_2024)
+  ) |>
+  mutate(
+    durusdinium_change = durusdinium__era_2024 - durusdinium__era_2019_21
+  )
+
+field_observed_species_labels <- function(flags) {
+  species <- field_observed_shift_summary$host_species_code[flags]
+  if (length(species) == 0) {
+    "None"
+  } else {
+    paste(sort(species), collapse = ", ")
+  }
+}
+
+field_observed_metric_table <- tibble(
+  `Field-observed summary` = c(
+    "2024 Durusdinium >= 50%",
+    "2024 Durusdinium >= 75%",
+    "2024 Durusdinium >= 90%",
+    "Increase >= 25 percentage points from 2019-21 to 2024",
+    "Increase >= 50 percentage points from 2019-21 to 2024",
+    "Shift from <25% to >=50% Durusdinium",
+    "Whole-community Hellinger distance >= 0.5"
+  ),
+  n_species = c(
+    sum(field_observed_shift_summary$durusdinium__era_2024 >= 0.50),
+    sum(field_observed_shift_summary$durusdinium__era_2024 >= 0.75),
+    sum(field_observed_shift_summary$durusdinium__era_2024 >= 0.90),
+    sum(field_observed_shift_summary$durusdinium_change >= 0.25),
+    sum(field_observed_shift_summary$durusdinium_change >= 0.50),
+    sum(
+      field_observed_shift_summary$durusdinium__era_2019_21 < 0.25 &
+        field_observed_shift_summary$durusdinium__era_2024 >= 0.50
+    ),
+    sum(field_observed_shift_summary$hellinger_2019_21_to_2024 >= 0.50)
+  ),
+  species = c(
+    field_observed_species_labels(field_observed_shift_summary$durusdinium__era_2024 >= 0.50),
+    field_observed_species_labels(field_observed_shift_summary$durusdinium__era_2024 >= 0.75),
+    field_observed_species_labels(field_observed_shift_summary$durusdinium__era_2024 >= 0.90),
+    field_observed_species_labels(field_observed_shift_summary$durusdinium_change >= 0.25),
+    field_observed_species_labels(field_observed_shift_summary$durusdinium_change >= 0.50),
+    field_observed_species_labels(
+      field_observed_shift_summary$durusdinium__era_2019_21 < 0.25 &
+        field_observed_shift_summary$durusdinium__era_2024 >= 0.50
+    ),
+    field_observed_species_labels(field_observed_shift_summary$hellinger_2019_21_to_2024 >= 0.50)
+  )
+)
+
+field_observed_metric_table |>
+  knitr::kable(
+    caption = "High-level field-observed Durusdinium shift metrics from species-level 2019-21 to 2024 comparisons"
+  )
+
+field_observed_species_table <- field_observed_shift_summary |>
+  arrange(desc(durusdinium__era_2024)) |>
+  transmute(
+    `Host species` = host_species_code,
+    `Durusdinium 2019-21` = scales::percent(durusdinium__era_2019_21, accuracy = 0.1),
+    `Durusdinium 2024` = scales::percent(durusdinium__era_2024, accuracy = 0.1),
+    `Change` = paste0(
+      if_else(durusdinium_change >= 0, "+", ""),
+      round(100 * durusdinium_change, 1),
+      " pp"
+    ),
+    `Hellinger distance` = round(hellinger_2019_21_to_2024, 3),
+    `n 2019-21` = n_total__era_2019_21,
+    `n 2024` = n_total__era_2024,
+    `Subregions included` = regions_included__era_2024
+  )
+
+field_observed_species_table |>
+  knitr::kable(
+    caption = "Species-level field-observed Durusdinium dominance and whole-community shift magnitude"
+  )
+```
+
+```{r field-observed-genus-shift-plots}
+make_field_observed_genus_plot <- function(genus_col, genus_name) {
+  plot_data <- across_region_composition |>
+    filter(era %in% c("2019-21", "2024")) |>
+    transmute(
+      host_species_code,
+      era,
+      n_total,
+      genus_proportion = .data[[genus_col]]
+    ) |>
+    group_by(host_species_code) |>
+    filter(all(c("2019-21", "2024") %in% era)) |>
+    ungroup()
+
+  species_order <- plot_data |>
+    filter(era == "2024") |>
+    arrange(genus_proportion) |>
+    pull(host_species_code)
+
+  plot_data <- plot_data |>
+    mutate(
+      host_species_code = factor(host_species_code, levels = species_order),
+      era = factor(era, levels = c("2019-21", "2024")),
+      genus_count = genus_proportion * n_total,
+      genus_adjusted = (genus_count + 0.5) / (n_total + 1),
+      genus_se = sqrt(genus_adjusted * (1 - genus_adjusted) / (n_total + 1)),
+      genus_lower = pmax(0, genus_proportion - genus_se),
+      genus_upper = pmin(1, genus_proportion + genus_se)
+    )
+
+  ggplot(plot_data, aes(x = genus_proportion, y = host_species_code)) +
+    geom_line(
+      aes(group = host_species_code),
+      color = "grey70",
+      linewidth = 0.6
+    ) +
+    geom_vline(
+      xintercept = c(0.50, 0.75),
+      linetype = "dashed",
+      color = "grey60",
+      linewidth = 0.4
+    ) +
+    geom_segment(
+      aes(
+        x = genus_lower,
+        xend = genus_upper,
+        yend = host_species_code,
+        color = era
+      ),
+      linewidth = 5,
+      alpha = 0.22,
+      lineend = "round"
+    ) +
+    geom_point(aes(color = era), size = 2.8, alpha = 0.9) +
+    scale_x_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      limits = c(0, 1),
+      expand = expansion(mult = c(0.01, 0.03))
+    ) +
+    scale_color_manual(values = c("2019-21" = "#3B6EA8", "2024" = "#C7533F")) +
+    labs(
+      x = paste(genus_name, "proportion"),
+      y = "Host species",
+      color = "Era",
+      title = paste("Field-observed", genus_name, "shifts by species"),
+      subtitle = "Species-level standardized field summaries; thick transparent bars show approximate +/- 1 SE"
+    ) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+field_observed_durusdinium_plot <- make_field_observed_genus_plot("D", "Durusdinium")
+field_observed_symbiodinium_plot <- make_field_observed_genus_plot("A", "Symbiodinium")
+field_observed_breviolum_plot <- make_field_observed_genus_plot("B", "Breviolum")
+field_observed_cladocopium_plot <- make_field_observed_genus_plot("C", "Cladocopium")
+
+field_observed_durusdinium_plot
+field_observed_symbiodinium_plot
+field_observed_breviolum_plot
+field_observed_cladocopium_plot
+
+ggsave("outputs/figures/field_observed_durusdinium_shifts_by_species.png", field_observed_durusdinium_plot, width = 9, height = 6.5, dpi = 300)
+ggsave("outputs/figures/field_observed_symbiodinium_shifts_by_species.png", field_observed_symbiodinium_plot, width = 9, height = 6.5, dpi = 300)
+ggsave("outputs/figures/field_observed_breviolum_shifts_by_species.png", field_observed_breviolum_plot, width = 9, height = 6.5, dpi = 300)
+ggsave("outputs/figures/field_observed_cladocopium_shifts_by_species.png", field_observed_cladocopium_plot, width = 9, height = 6.5, dpi = 300)
+```
+
+## Sample-level dominance and mixing
+
+The genus-proportion plots above summarize the standardized average ITS2 profile
+for each species and era. The companion plots below classify individual samples
+first, then summarize the standardized fraction of samples in each category.
+These plots help distinguish a shift caused by many colonies becoming dominated
+by a genus from a shift caused by more mixed communities within colonies.
+
+```{r field-observed-sample-level-summary}
+genus_labels <- c(
+  A = "Symbiodinium",
+  B = "Breviolum",
+  C = "Cladocopium",
+  D = "Durusdinium",
+  G = "Gerakladium"
+)
+
+sample_level_metric_cols <- c(
+  paste0("dominant_", clades),
+  "durusdinium_ge_50",
+  "durusdinium_ge_75",
+  "durusdinium_ge_90"
+)
+
+field_observed_sample_metrics <- sample_clades_retained |>
+  mutate(
+    dominant_genus = recode(dominant_clade, !!!genus_labels),
+    across(all_of(clades), ~ replace_na(.x, 0))
+  ) |>
+  mutate(
+    dominant_A = as.numeric(dominant_clade == "A"),
+    dominant_B = as.numeric(dominant_clade == "B"),
+    dominant_C = as.numeric(dominant_clade == "C"),
+    dominant_D = as.numeric(dominant_clade == "D"),
+    dominant_G = as.numeric(dominant_clade == "G"),
+    durusdinium_ge_50 = as.numeric(D >= 0.50),
+    durusdinium_ge_75 = as.numeric(D >= 0.75),
+    durusdinium_ge_90 = as.numeric(D >= 0.90)
+  )
+
+weighted_sample_metric_summary <- function(data, metric_cols,
+                                           group_cols = c("collection_subregion", "host_species_code"),
+                                           min_n = 2, n_bins = 6,
+                                           site_col = "collection_site_harmonized",
+                                           no_depth_standardization_subregions = "Dry Tortugas") {
+  data |>
+    group_by(across(all_of(group_cols))) |>
+    group_modify(\(.x, .y) {
+      df <- .x
+      subregion <- if ("collection_subregion" %in% names(.y)) .y$collection_subregion else NA_character_
+      skip_depth_standardization <- !is.na(subregion) && subregion %in% no_depth_standardization_subregions
+      has_complete_depth <- all(!is.na(df$depth_ft))
+      depth_bins <- if (has_complete_depth) make_depth_bins(df$depth_ft, n_bins = n_bins) else factor(rep(NA_character_, nrow(df)))
+      use_depth_standardization <- !skip_depth_standardization && has_complete_depth && !all(is.na(depth_bins))
+      use_site_standardization <- site_col %in% names(df) && n_distinct(df[[site_col]], na.rm = TRUE) > 1
+
+      if (use_depth_standardization) {
+        df <- mutate(df, depth_bin = depth_bins)
+      }
+
+      strata_cols <- c(
+        if (use_depth_standardization) "depth_bin",
+        if (use_site_standardization) site_col
+      )
+
+      map_dfr(eras, \(era_i) {
+        era_df <- filter(df, era == era_i)
+        n_samples <- nrow(era_df)
+
+        if (n_samples < min_n) {
+          metric_values <- set_names(rep(NA_real_, length(metric_cols)), metric_cols)
+        } else {
+          weights <- if (length(strata_cols) > 0) {
+            stratification_weights(era_df, df, strata_cols)
+          } else {
+            rep(1, n_samples)
+          }
+
+          if (sum(weights, na.rm = TRUE) == 0) {
+            weights <- rep(1, n_samples)
+          }
+
+          weights <- weights / sum(weights, na.rm = TRUE)
+          metric_values <- map_dbl(metric_cols, \(metric_col) {
+            sum(era_df[[metric_col]] * weights, na.rm = TRUE)
+          }) |>
+            set_names(metric_cols)
+        }
+
+        tibble(era = era_i, n = n_samples, !!!as.list(metric_values))
+      })
+    }) |>
+    ungroup() |>
+    mutate(era = factor(era, levels = eras))
+}
+
+sample_metric_by_region <- weighted_sample_metric_summary(
+  field_observed_sample_metrics,
+  sample_level_metric_cols,
+  min_n = min_n,
+  n_bins = 6,
+  no_depth_standardization_subregions = "Dry Tortugas"
+)
+
+sample_metric_across_region <- sample_metric_by_region |>
+  filter(if_any(all_of(sample_level_metric_cols), ~ !is.na(.x))) |>
+  summarize(
+    n_total = sum(n),
+    n_regions = n_distinct(collection_subregion),
+    regions_included = paste(sort(unique(collection_subregion)), collapse = "; "),
+    across(all_of(sample_level_metric_cols), ~ mean(.x, na.rm = TRUE)),
+    .by = c(host_species_code, era)
+  )
+
+sample_level_plot_species <- sample_metric_across_region |>
+  filter(era %in% c("2019-21", "2024"), !is.na(dominant_D)) |>
+  summarize(n_eras = n_distinct(era), .by = host_species_code) |>
+  filter(n_eras == 2) |>
+  pull(host_species_code)
+
+durusdinium_sample_prevalence_table <- sample_metric_across_region |>
+  filter(
+    host_species_code %in% sample_level_plot_species,
+    era %in% c("2019-21", "2024")
+  ) |>
+  mutate(era_key = if_else(era == "2019-21", "era_2019_21", "era_2024")) |>
+  select(
+    host_species_code, era_key, n_total,
+    dominant_D,
+    durusdinium_ge_50,
+    durusdinium_ge_75,
+    durusdinium_ge_90
+  ) |>
+  pivot_wider(
+    names_from = era_key,
+    values_from = c(n_total, dominant_D, durusdinium_ge_50, durusdinium_ge_75, durusdinium_ge_90),
+    names_sep = "__"
+  ) |>
+  filter(!is.na(dominant_D__era_2019_21), !is.na(dominant_D__era_2024)) |>
+  transmute(
+    `Host species` = host_species_code,
+    `Durusdinium-dominant 2019-21` = scales::percent(dominant_D__era_2019_21, accuracy = 1),
+    `Durusdinium-dominant 2024` = scales::percent(dominant_D__era_2024, accuracy = 1),
+    `>=75% Durusdinium 2024` = scales::percent(durusdinium_ge_75__era_2024, accuracy = 1),
+    `>=90% Durusdinium 2024` = scales::percent(durusdinium_ge_90__era_2024, accuracy = 1),
+    `n 2019-21` = n_total__era_2019_21,
+    `n 2024` = n_total__era_2024
+  )
+
+durusdinium_sample_prevalence_table |>
+  knitr::kable(
+    caption = "Standardized sample-level Durusdinium prevalence. Values are fractions of samples/colonies, not mean sequence composition."
+  )
+```
+
+```{r field-observed-dominant-genus-plot}
+dominant_genus_plot_data <- sample_metric_across_region |>
+  filter(
+    host_species_code %in% sample_level_plot_species,
+    era %in% c("2019-21", "2024")
+  ) |>
+  select(host_species_code, era, starts_with("dominant_")) |>
+  pivot_longer(
+    cols = starts_with("dominant_"),
+    names_to = "dominant_clade",
+    values_to = "prevalence"
+  ) |>
+  mutate(
+    genus = recode(str_remove(dominant_clade, "^dominant_"), !!!genus_labels)
+  )
+
+dominant_genus_species_order <- dominant_genus_plot_data |>
+  filter(era == "2024", genus == "Durusdinium") |>
+  arrange(prevalence) |>
+  pull(host_species_code) |>
+  unique()
+
+dominant_genus_species_order <- c(
+  dominant_genus_species_order,
+  setdiff(sort(unique(dominant_genus_plot_data$host_species_code)), dominant_genus_species_order)
+)
+
+dominant_genus_plot_stacked <- dominant_genus_plot_data |>
+  mutate(
+    host_species_code = factor(host_species_code, levels = dominant_genus_species_order),
+    era = factor(era, levels = c("2019-21", "2024")),
+    genus = factor(genus, levels = unname(genus_labels))
+  ) |>
+  arrange(era, host_species_code, genus) |>
+  group_by(era, host_species_code) |>
+  mutate(
+    xmin = cumsum(lag(prevalence, default = 0)),
+    xmax = pmin(1, xmin + prevalence),
+    y = as.numeric(host_species_code)
+  ) |>
+  ungroup()
+
+dominant_genus_plot <- ggplot(dominant_genus_plot_stacked) +
+  geom_rect(
+    aes(
+      xmin = xmin,
+      xmax = xmax,
+      ymin = y - 0.38,
+      ymax = y + 0.38,
+      fill = genus
+    ),
+    color = "white",
+    linewidth = 0.25
+  ) +
+  facet_wrap(~ era, nrow = 1) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_y_continuous(
+    breaks = seq_along(dominant_genus_species_order),
+    labels = dominant_genus_species_order,
+    expand = expansion(add = 0.7)
+  ) +
+  scale_fill_manual(
+    values = c(
+      Symbiodinium = "#7B5EA7",
+      Breviolum = "#4C78A8",
+      Cladocopium = "#59A14F",
+      Durusdinium = "#D55E00",
+      Gerakladium = "#8C6D31"
+    ),
+    drop = FALSE
+  ) +
+  coord_cartesian(xlim = c(0, 1)) +
+  labs(
+    x = "Standardized fraction of samples",
+    y = "Host species",
+    fill = "Dominant genus",
+    title = "Dominant symbiont genus by species and era",
+    subtitle = "Each sample is classified by its most abundant genus before site/depth-standardized summarization"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+dominant_genus_plot
+
+ggsave("outputs/figures/field_observed_dominant_genus_by_species_era.png", dominant_genus_plot, width = 11, height = 6.5, dpi = 300)
+```
+
+```{r field-observed-durusdinium-sample-threshold-plot}
+durusdinium_threshold_plot_data <- sample_metric_across_region |>
+  filter(
+    host_species_code %in% sample_level_plot_species,
+    era %in% c("2019-21", "2024")
+  ) |>
+  select(
+    host_species_code, era, n_total,
+    `Durusdinium-dominant\n(>=50%)` = durusdinium_ge_50,
+    `Strongly Durusdinium\n(>=75%)` = durusdinium_ge_75,
+    `Nearly fixed\n(>=90%)` = durusdinium_ge_90
+  ) |>
+  pivot_longer(
+    cols = contains("Durusdinium") | contains("fixed"),
+    names_to = "threshold",
+    values_to = "prevalence"
+  ) |>
+  mutate(
+    prevalence_count = prevalence * n_total,
+    prevalence_adjusted = (prevalence_count + 0.5) / (n_total + 1),
+    prevalence_se = sqrt(prevalence_adjusted * (1 - prevalence_adjusted) / (n_total + 1)),
+    prevalence_lower = pmax(0, prevalence - prevalence_se),
+    prevalence_upper = pmin(1, prevalence + prevalence_se)
+  )
+
+durusdinium_threshold_species_order <- durusdinium_threshold_plot_data |>
+  filter(era == "2024", threshold == "Durusdinium-dominant\n(>=50%)") |>
+  arrange(prevalence) |>
+  pull(host_species_code) |>
+  unique()
+
+durusdinium_threshold_species_order <- c(
+  durusdinium_threshold_species_order,
+  setdiff(sort(unique(durusdinium_threshold_plot_data$host_species_code)), durusdinium_threshold_species_order)
+)
+
+durusdinium_threshold_plot <- durusdinium_threshold_plot_data |>
+  mutate(
+    host_species_code = factor(host_species_code, levels = durusdinium_threshold_species_order),
+    era = factor(era, levels = c("2019-21", "2024"))
+  ) |>
+  ggplot(aes(x = prevalence, y = host_species_code)) +
+  geom_line(aes(group = host_species_code), color = "grey70", linewidth = 0.5) +
+  geom_segment(
+    aes(
+      x = prevalence_lower,
+      xend = prevalence_upper,
+      yend = host_species_code,
+      color = era
+    ),
+    linewidth = 4.5,
+    alpha = 0.22,
+    lineend = "round"
+  ) +
+  geom_point(aes(color = era), size = 2.5, alpha = 0.9) +
+  facet_wrap(~ threshold, nrow = 1) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 1),
+    expand = expansion(mult = c(0.01, 0.03))
+  ) +
+  scale_color_manual(values = c("2019-21" = "#3B6EA8", "2024" = "#C7533F")) +
+  labs(
+    x = "Standardized fraction of samples",
+    y = "Host species",
+    color = "Era",
+    title = "Durusdinium prevalence thresholds by species",
+    subtitle = "Each point is the fraction of samples meeting a within-sample Durusdinium threshold"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+durusdinium_threshold_plot
+
+ggsave("outputs/figures/field_observed_durusdinium_sample_thresholds_by_species.png", durusdinium_threshold_plot, width = 13, height = 6.5, dpi = 300)
+```
+
 # Field shifts versus experimental shuffling
 
 The primary comparison asks whether species with stronger experimental
