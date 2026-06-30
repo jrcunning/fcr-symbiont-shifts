@@ -12,7 +12,7 @@ required_files <- tribble(
   "metadata", "metadata/decadalshifts_SST.xls", "Sample metadata with sample_name, collection_date, collection_region, collection_subregion, collection_site, collection_depth_ft, host_genus, and host_species.",
   "pawar_variants", "data/raw/20240723T194127_Pawar_Run /post_med_seqs/500_20240730T092802_DBV_20240730T195050.seqs.absolute.abund_and_meta.txt", "SymPortal post-MED sequence absolute abundance table for the Pawar run.",
   "conn_variants", "data/raw/20250717T180136_conntr1/post_med_seqs/610_20250905T171203_DBV_20250910T163211.seqs.absolute.abund_and_meta.txt", "SymPortal post-MED sequence absolute abundance table for the Conn Dry Tortugas run.",
-  "experimental_shuffling", "data/raw/experimental_shuffling_coef.csv", "Experimental shuffling coefficients and experimental clade-D summaries by coral species."
+  "experimental_shuffling", "data/raw/experimental_shuffling_coef.csv", "Experimental shuffling coefficients and experimental Durusdinium summaries by coral species."
 )
 
 load_sample_metadata <- function(path) {
@@ -198,25 +198,38 @@ make_depth_bins <- function(depth, n_bins = 6) {
 }
 
 depth_weights <- function(group_df, target_bins) {
-  target <- tibble(depth_bin = target_bins) |>
-    filter(!is.na(depth_bin)) |>
-    count(depth_bin, name = "n_target") |>
+  target_df <- tibble(depth_bin = target_bins)
+  stratification_weights(group_df, target_df, "depth_bin")
+}
+
+stratification_weights <- function(group_df, target_df, strata_cols) {
+  if (length(strata_cols) == 0) {
+    return(rep(1, nrow(group_df)))
+  }
+
+  target <- target_df |>
+    filter(if_all(all_of(strata_cols), ~ !is.na(.x))) |>
+    count(across(all_of(strata_cols)), name = "n_target") |>
     mutate(p_target = n_target / sum(n_target))
 
   source <- group_df |>
-    filter(!is.na(depth_bin)) |>
-    count(depth_bin, name = "n_source") |>
+    filter(if_all(all_of(strata_cols), ~ !is.na(.x))) |>
+    count(across(all_of(strata_cols)), name = "n_source") |>
     mutate(p_source = n_source / sum(n_source))
 
+  if (nrow(target) == 0 || nrow(source) == 0) {
+    return(rep(1, nrow(group_df)))
+  }
+
   weight_table <- target |>
-    left_join(source, by = "depth_bin") |>
+    left_join(source, by = strata_cols) |>
     mutate(
       p_source = replace_na(p_source, 0),
       weight = if_else(p_source > 0, p_target / p_source, 0)
     )
 
   group_df |>
-    left_join(select(weight_table, depth_bin, weight), by = "depth_bin") |>
+    left_join(select(weight_table, all_of(strata_cols), weight), by = strata_cols) |>
     mutate(weight = replace_na(weight, 0)) |>
     pull(weight)
 }
@@ -293,6 +306,7 @@ distance_correlation_summary <- function(df) {
 
 standardized_era_composition <- function(data, group_cols = c("collection_subregion", "host_species_code"),
                                          min_n = 4, n_bins = 6, clade_cols = clades,
+                                         site_col = "collection_site_harmonized",
                                          no_depth_standardization_subregions = "Dry Tortugas") {
   data |>
     group_by(across(all_of(group_cols))) |>
@@ -303,16 +317,29 @@ standardized_era_composition <- function(data, group_cols = c("collection_subreg
       has_complete_depth <- all(!is.na(df$depth_ft))
       depth_bins <- if (has_complete_depth) make_depth_bins(df$depth_ft, n_bins = n_bins) else factor(rep(NA_character_, nrow(df)))
       use_depth_standardization <- !skip_depth_standardization && has_complete_depth && !all(is.na(depth_bins))
+      use_site_standardization <- site_col %in% names(df) && n_distinct(df[[site_col]], na.rm = TRUE) > 1
+      standardization_terms <- character()
 
       if (use_depth_standardization) {
         df <- mutate(df, depth_bin = depth_bins)
-        target_bins <- df$depth_bin
-        standardization_method <- "Depth-standardized"
-      } else if (skip_depth_standardization) {
-        standardization_method <- "Not depth-standardized: Dry Tortugas"
-      } else {
-        standardization_method <- "Not depth-standardized"
+        standardization_terms <- c(standardization_terms, "depth")
       }
+      if (use_site_standardization) {
+        standardization_terms <- c(standardization_terms, "site")
+      }
+
+      standardization_method <- case_when(
+        setequal(standardization_terms, c("depth", "site")) ~ "Depth- and site-standardized",
+        identical(standardization_terms, "depth") ~ "Depth-standardized",
+        identical(standardization_terms, "site") ~ "Site-standardized",
+        skip_depth_standardization ~ "Not depth-standardized: Dry Tortugas",
+        TRUE ~ "Not depth-standardized"
+      )
+
+      strata_cols <- c(
+        if (use_depth_standardization) "depth_bin",
+        if (use_site_standardization) site_col
+      )
 
       map_dfr(eras, \(era_i) {
         era_df <- filter(df, era == era_i)
@@ -320,8 +347,8 @@ standardized_era_composition <- function(data, group_cols = c("collection_subreg
 
         if (n_samples < min_n) {
           comp <- set_names(rep(NA_real_, length(clade_cols)), clade_cols)
-        } else if (use_depth_standardization) {
-          comp <- weighted_composition(era_df, depth_weights(era_df, target_bins), clade_cols)
+        } else if (length(strata_cols) > 0) {
+          comp <- weighted_composition(era_df, stratification_weights(era_df, df, strata_cols), clade_cols)
         } else {
           comp <- weighted_composition(era_df, clade_cols = clade_cols)
         }
@@ -330,6 +357,7 @@ standardized_era_composition <- function(data, group_cols = c("collection_subreg
           era = era_i,
           n = n_samples,
           depth_standardized = use_depth_standardization,
+          site_standardized = use_site_standardization,
           standardization_method = standardization_method,
           !!!as.list(comp)
         )
@@ -337,6 +365,88 @@ standardized_era_composition <- function(data, group_cols = c("collection_subreg
     }) |>
     ungroup() |>
     mutate(era = factor(era, levels = eras))
+}
+
+standardization_target_distribution <- function(data, composition,
+                                                group_cols = c("collection_subregion", "host_species_code"),
+                                                n_bins = 6,
+                                                site_col = "collection_site_harmonized",
+                                                no_depth_standardization_subregions = "Dry Tortugas") {
+  data |>
+    group_by(across(all_of(group_cols))) |>
+    group_modify(\(.x, .y) {
+      df <- .x
+      subregion <- if ("collection_subregion" %in% names(.y)) .y$collection_subregion else NA_character_
+      skip_depth_standardization <- !is.na(subregion) && subregion %in% no_depth_standardization_subregions
+      has_complete_depth <- all(!is.na(df$depth_ft))
+      depth_bins <- if (has_complete_depth) make_depth_bins(df$depth_ft, n_bins = n_bins) else factor(rep(NA_character_, nrow(df)))
+      use_depth_standardization <- !skip_depth_standardization && has_complete_depth && !all(is.na(depth_bins))
+      use_site_standardization <- site_col %in% names(df) && n_distinct(df[[site_col]], na.rm = TRUE) > 1
+
+      if (use_depth_standardization) {
+        df <- mutate(df, depth_bin = depth_bins)
+      } else {
+        df <- mutate(df, depth_bin = NA_character_)
+      }
+
+      if (!use_site_standardization) {
+        df <- mutate(df, !!site_col := NA_character_)
+      }
+
+      strata_cols <- c(
+        if (use_site_standardization) site_col,
+        if (use_depth_standardization) "depth_bin"
+      )
+
+      standardization_method <- composition |>
+        semi_join(.y, by = group_cols) |>
+        distinct(standardization_method) |>
+        pull(standardization_method)
+
+      if (length(standardization_method) == 0) {
+        standardization_method <- NA_character_
+      }
+
+      if (length(strata_cols) == 0) {
+        return(tibble(
+          standardization_method = standardization_method[1],
+          collection_site_harmonized = NA_character_,
+          depth_bin = NA_character_,
+          n_target = nrow(df),
+          target_proportion = 1
+        ))
+      }
+
+      target_counts <- df |>
+        filter(if_all(all_of(strata_cols), ~ !is.na(.x))) |>
+        count(across(all_of(strata_cols)), name = "n_target")
+
+      if (site_col %in% names(target_counts) && site_col != "collection_site_harmonized") {
+        target_counts <- rename(target_counts, collection_site_harmonized = all_of(site_col))
+      }
+
+      if (!use_site_standardization) {
+        target_counts <- mutate(target_counts, collection_site_harmonized = NA_character_)
+      }
+      if (!use_depth_standardization) {
+        target_counts <- mutate(target_counts, depth_bin = NA_character_)
+      }
+
+      target_counts |>
+        mutate(
+          standardization_method = standardization_method[1],
+          target_total_n = sum(n_target),
+          target_proportion = n_target / target_total_n,
+          target_percent = 100 * target_proportion
+        ) |>
+        arrange(desc(target_proportion), collection_site_harmonized, depth_bin) |>
+        select(
+          standardization_method,
+          collection_site_harmonized, depth_bin,
+          n_target, target_total_n, target_proportion, target_percent
+        )
+    }) |>
+    ungroup()
 }
 
 compare_eras <- function(composition, clade_cols = clades) {
@@ -358,6 +468,7 @@ compare_eras <- function(composition, clade_cols = clades) {
         n1 <- if (nrow(p1) == 1) p1$n else NA_integer_
         n2 <- if (nrow(p2) == 1) p2$n else NA_integer_
         depth_standardized <- if (nrow(p1) == 1) p1$depth_standardized else NA
+        site_standardized <- if (nrow(p1) == 1 && "site_standardized" %in% names(p1)) p1$site_standardized else NA
         standardization_method <- if (nrow(p1) == 1) p1$standardization_method else NA_character_
 
         if (nrow(p1) != 1 || nrow(p2) != 1 || anyNA(select(p1, all_of(clade_cols))) || anyNA(select(p2, all_of(clade_cols)))) {
@@ -367,6 +478,7 @@ compare_eras <- function(composition, clade_cols = clades) {
             n1 = n1,
             n2 = n2,
             depth_standardized = depth_standardized,
+            site_standardized = site_standardized,
             standardization_method = standardization_method,
             TV = NA_real_,
             Hellinger = NA_real_,
@@ -383,6 +495,7 @@ compare_eras <- function(composition, clade_cols = clades) {
           n1 = n1,
           n2 = n2,
           depth_standardized = depth_standardized,
+          site_standardized = site_standardized,
           standardization_method = standardization_method,
           TV = total_variation_distance(v1, v2),
           Hellinger = hellinger_distance(v1, v2),
@@ -651,6 +764,7 @@ partial_pool_all_region_composition <- function(sample_data,
 
 permanova_by_group <- function(data, group_cols = c("collection_subregion", "host_species_code"),
                                min_n = 4, clade_cols = clades, permutations = 999,
+                               site_col = "collection_site_harmonized",
                                no_depth_adjustment_subregions = "Dry Tortugas") {
   data |>
     group_by(across(all_of(group_cols))) |>
@@ -665,56 +779,68 @@ permanova_by_group <- function(data, group_cols = c("collection_subregion", "hos
       if (use_depth_adjustment) {
         df <- mutate(df, depth_bin = depth_bins)
       }
+      use_site_adjustment <- site_col %in% names(df) && n_distinct(df[[site_col]], na.rm = TRUE) > 1
+      if (use_site_adjustment) {
+        df <- mutate(df, site_factor = factor(.data[[site_col]]))
+      }
 
       era_counts <- df |>
         count(era) |>
         filter(n >= min_n)
 
+      adjustment_terms <- c(
+        if (use_depth_adjustment) "depth_bin",
+        if (use_site_adjustment) "site_factor"
+      )
+      test_terms <- c(adjustment_terms, "era")
+      test_formula <- paste("composition ~", paste(test_terms, collapse = " + "))
+
       if (nrow(era_counts) < 2) {
         return(tibble(
           n = nrow(df),
           eras_tested = nrow(era_counts),
+          site_adjusted = use_site_adjustment,
           depth_adjusted = use_depth_adjustment,
-          test_formula = if_else(use_depth_adjustment, "composition ~ era + depth_bin", "composition ~ era"),
-          r2_era = NA_real_,
-          p_era = NA_real_,
+          test_formula = test_formula,
           r2_depth_bin = NA_real_,
-          p_depth_bin = NA_real_
+          p_depth_bin = NA_real_,
+          r2_site = NA_real_,
+          p_site = NA_real_,
+          r2_era = NA_real_,
+          p_era = NA_real_
         ))
       }
 
       df <- filter(df, era %in% era_counts$era)
-      if (use_depth_adjustment) {
-        fit <- vegan::adonis2(
-          as.matrix(select(df, all_of(clade_cols))) ~ era + depth_bin,
-          data = df,
-          method = "bray",
-          permutations = permutations
-        )
+      composition <- as.matrix(select(df, all_of(clade_cols)))
+      fit_formula <- reformulate(test_terms, response = "composition")
+      fit <- vegan::adonis2(
+        fit_formula,
+        data = df,
+        method = "bray",
+        permutations = permutations
+      )
 
-        r2_depth_bin <- fit$R2[2]
-        p_depth_bin <- fit$`Pr(>F)`[2]
-      } else {
-        fit <- vegan::adonis2(
-          as.matrix(select(df, all_of(clade_cols))) ~ era,
-          data = df,
-          method = "bray",
-          permutations = permutations
-        )
-
-        r2_depth_bin <- NA_real_
-        p_depth_bin <- NA_real_
-      }
+      fit_terms <- rownames(fit)
+      r2_site <- if ("site_factor" %in% fit_terms) fit$R2[fit_terms == "site_factor"] else NA_real_
+      p_site <- if ("site_factor" %in% fit_terms) fit$`Pr(>F)`[fit_terms == "site_factor"] else NA_real_
+      r2_depth_bin <- if ("depth_bin" %in% fit_terms) fit$R2[fit_terms == "depth_bin"] else NA_real_
+      p_depth_bin <- if ("depth_bin" %in% fit_terms) fit$`Pr(>F)`[fit_terms == "depth_bin"] else NA_real_
+      r2_era <- if ("era" %in% fit_terms) fit$R2[fit_terms == "era"] else NA_real_
+      p_era <- if ("era" %in% fit_terms) fit$`Pr(>F)`[fit_terms == "era"] else NA_real_
 
       tibble(
         n = nrow(df),
         eras_tested = n_distinct(df$era),
+        site_adjusted = use_site_adjustment,
         depth_adjusted = use_depth_adjustment,
-        test_formula = if_else(use_depth_adjustment, "composition ~ era + depth_bin", "composition ~ era"),
-        r2_era = fit$R2[1],
-        p_era = fit$`Pr(>F)`[1],
+        test_formula = test_formula,
         r2_depth_bin = r2_depth_bin,
-        p_depth_bin = p_depth_bin
+        p_depth_bin = p_depth_bin,
+        r2_site = r2_site,
+        p_site = p_site,
+        r2_era = r2_era,
+        p_era = p_era
       )
     }) |>
     ungroup()

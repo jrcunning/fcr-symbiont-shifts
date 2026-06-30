@@ -77,6 +77,11 @@ readr::write_csv(sample_retention$stage_counts, "outputs/tables/sample_retention
 readr::write_csv(sample_retention$dropped_samples, "outputs/tables/dropped_samples.csv")
 ```
 
+## Audit sample retention
+
+Review how many imported samples are retained after metadata matching, Florida
+filtering, era assignment, and read-depth filtering.
+
 ```{r sample-summary}
 sample_retention$stage_counts |>
   knitr::kable(caption = "Sample retention audit")
@@ -85,97 +90,401 @@ if (nrow(sample_retention$duplicate_sample_names) > 0) {
   sample_retention$duplicate_sample_names |>
     knitr::kable(caption = "Sample names present in more than one imported run")
 }
+```
 
+## Summarize samples by era
+
+Visualize the retained samples across collection subregions, host species, and
+sampling eras before any species-group filtering.
+
+```{r sample-summary-by-era}
 sample_summary <- sample_clades |>
   count(collection_subregion, host_species_code, era, name = "n") |>
   arrange(collection_subregion, host_species_code, era)
 
-readr::write_csv(sample_summary, "outputs/tables/sample_counts_by_era.csv")
+plot_sample_count_heatmap <- function(summary_df, title, subtitle) {
+  species_order <- summary_df |>
+    group_by(host_species_code) |>
+    summarize(total = sum(n), .groups = "drop") |>
+    arrange(total) |>
+    pull(host_species_code)
 
-knitr::kable(sample_summary)
+  summary_df |>
+    mutate(
+      era = factor(era, levels = eras),
+      host_species_code = factor(host_species_code, levels = species_order)
+    ) |>
+    ggplot(aes(x = era, y = host_species_code, fill = n)) +
+    geom_tile(color = "white", linewidth = 0.6) +
+    geom_text(aes(label = n), size = 3) +
+    facet_wrap(~ collection_subregion, nrow = 1) +
+    scale_fill_gradient(low = "#f7f7f2", high = "#2a6f97", name = "Samples") +
+    labs(
+      x = NULL,
+      y = "Host species",
+      fill = "Samples",
+      title = title,
+      subtitle = subtitle
+    ) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(face = "bold"),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold"),
+      panel.spacing.x = unit(1.2, "lines"),
+      axis.text.x = element_text(angle = 35, hjust = 1),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank()
+    )
+}
+
+plot_sample_count_heatmap(
+  sample_summary,
+  title = "ITS2 samples retained for analysis",
+  subtitle = "Counts by collection subregion, host species, and sampling era"
+)
 ```
 
-```{r drto-site-species-sample-summary}
-drto_site_species_summary <- sample_clades |>
-  filter(collection_subregion == "Dry Tortugas") |>
-  count(
-    collection_subregion, collection_site, host_species_code, era,
-    host_genus, host_species,
-    name = "n_samples"
-  ) |>
-  arrange(collection_site, host_species_code)
+## Filter analysis groups
 
-readr::write_csv(
-  drto_site_species_summary,
-  "outputs/tables/drto_its2_sample_counts_by_site_species.csv"
-)
+Keep only subregion-by-species groups with enough samples for era comparisons:
+at least `sample_filter_min_total` total samples and at least
+`sample_filter_min_eras` eras with `sample_filter_min_n` samples.
+
+```{r filter-analysis-groups}
+sample_filter_min_n <- 2
+sample_filter_min_eras <- 2
+sample_filter_min_total <- 11
+
+sample_group_filter <- sample_summary |>
+  group_by(collection_subregion, host_species_code) |>
+  summarize(
+    total_n = sum(n),
+    eras_at_min_n = sum(n >= sample_filter_min_n),
+    retained = total_n >= sample_filter_min_total & eras_at_min_n >= sample_filter_min_eras,
+    .groups = "drop"
+  )
+
+sample_filter_audit <- sample_group_filter |>
+  count(collection_subregion, retained, name = "n_species_groups")
 
 knitr::kable(
-  drto_site_species_summary,
-  caption = "Dry Tortugas ITS2 samples retained for the main analysis by site and species"
+  sample_filter_audit,
+  caption = paste(
+    "Species groups retained with total n >=",
+    sample_filter_min_total,
+    "and at least",
+    sample_filter_min_eras,
+    "eras with n >=",
+    sample_filter_min_n
+  )
 )
+
+retained_sample_groups <- sample_group_filter |>
+  filter(retained) |>
+  select(collection_subregion, host_species_code)
+
+sample_summary_retained <- sample_summary |>
+  semi_join(retained_sample_groups, by = c("collection_subregion", "host_species_code"))
+
+plot_sample_count_heatmap(
+  sample_summary_retained,
+  title = "ITS2 samples retained after species-group filtering",
+  subtitle = paste(
+    "Keeping subregion-species groups with total n >=",
+    sample_filter_min_total,
+    "and at least",
+    sample_filter_min_eras,
+    "eras with n >=",
+    sample_filter_min_n
+  )
+)
+```
+
+## Harmonize collection site names
+
+Create a harmonized site-name variable before site-level diagnostics. Current
+manual rules only modify Upper Keys names; other subregions retain their raw
+site names.
+
+```{r harmonize-site-names}
+sample_clades_retained <- sample_clades |>
+  semi_join(retained_sample_groups, by = c("collection_subregion", "host_species_code")) |>
+  mutate(
+    collection_site_harmonized = case_when(
+      collection_subregion == "Upper Keys" &
+        str_detect(str_to_lower(collection_site), "cheeca") ~ "Cheeca Rocks",
+      collection_subregion == "Upper Keys" &
+        str_detect(str_to_lower(collection_site), "outer reef") ~ "Outer Reef",
+      collection_subregion == "Upper Keys" &
+        str_to_lower(collection_site) %in% c("conch", "conch reef") ~ "Conch",
+      collection_subregion == "Upper Keys" &
+        collection_site %in% c("Hens and Chickens", "Tavernier Rocks") ~ "Tavernier Rocks",
+      TRUE ~ collection_site
+    )
+  )
+```
+
+## Summarize retained sites
+
+Break the filtered samples down by harmonized collection site, host species,
+and sampling era. Within each site, era slots are ordered left-to-right as
+`2001-03`, `2019-21`, and `2024`.
+
+```{r site-species-era-summary}
+site_species_summary <- sample_clades_retained |>
+  filter(!is.na(collection_site_harmonized), !is.na(era)) |>
+  count(
+    collection_subregion, collection_site_harmonized,
+    host_species_code, era,
+    name = "n_samples"
+  )
+
+plot_site_species_heatmap <- function(summary_df, subregion) {
+  subregion_df <- summary_df |>
+    filter(collection_subregion == subregion)
+
+  site_positions <- subregion_df |>
+    group_by(collection_site_harmonized) |>
+    summarize(
+      site_n = sum(n_samples),
+      n_2024 = sum(if_else(era == "2024", n_samples, 0L)),
+      .groups = "drop"
+    ) |>
+    arrange(desc(n_2024), desc(site_n), collection_site_harmonized) |>
+    mutate(site_index = row_number())
+
+  species_positions <- subregion_df |>
+    group_by(host_species_code) |>
+    summarize(species_n = sum(n_samples), .groups = "drop") |>
+    arrange(species_n) |>
+    mutate(species_y = row_number())
+
+  era_offsets <- tibble(
+    era = factor(eras, levels = eras),
+    era_offset = c(-0.26, 0, 0.26)
+  )
+
+  plot_df <- subregion_df |>
+    left_join(site_positions, by = "collection_site_harmonized") |>
+    left_join(species_positions, by = "host_species_code") |>
+    left_join(era_offsets, by = "era") |>
+    mutate(x = site_index + era_offset)
+
+  site_breaks <- site_positions |>
+    filter(site_index < max(site_index)) |>
+    mutate(xintercept = site_index + 0.5)
+
+  ggplot(plot_df, aes(x = x, y = species_y, fill = n_samples)) +
+    geom_vline(
+      data = site_breaks,
+      aes(xintercept = xintercept),
+      color = "grey84",
+      linewidth = 0.25
+    ) +
+    geom_tile(width = 0.24, height = 0.78, color = "white", linewidth = 0.35) +
+    geom_text(aes(label = n_samples), size = 3) +
+    scale_x_continuous(
+      breaks = site_positions$site_index,
+      labels = site_positions$collection_site_harmonized,
+      expand = expansion(add = 0.7)
+    ) +
+    scale_y_continuous(
+      breaks = species_positions$species_y,
+      labels = species_positions$host_species_code,
+      expand = expansion(add = 0.6)
+    ) +
+    scale_fill_gradient(low = "#f7f7f2", high = "#2a6f97", name = "Samples") +
+    labs(
+      x = "Harmonized collection site (left to right within site: 2001-03, 2019-21, 2024)",
+      y = "Host species",
+      title = paste("Filtered", subregion, "samples by harmonized site"),
+      subtitle = "Each site has one x-axis label and fixed three-era slots"
+    ) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      axis.text.y = element_text(size = 10),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank()
+    )
+}
+
+plot_site_species_heatmap(site_species_summary, "Dry Tortugas")
+plot_site_species_heatmap(site_species_summary, "Upper Keys")
 ```
 
 # Sampling depth diagnostics
 
+Summarize depth distributions by harmonized collection site, host species, and
+era to check whether cross-era comparisons are being driven by site-level depth
+differences.
+
 ```{r depth-diagnostics}
-depth_summary <- sample_clades |>
-  group_by(collection_subregion, host_species_code, era) |>
+depth_summary <- sample_clades_retained |>
+  group_by(
+    collection_subregion, collection_site_harmonized,
+    host_species_code, era
+  ) |>
   summarize(
     n = n(),
+    n_depth = sum(!is.na(depth_ft)),
     median_depth_ft = median(depth_ft, na.rm = TRUE),
     q25_depth_ft = quantile(depth_ft, 0.25, na.rm = TRUE),
     q75_depth_ft = quantile(depth_ft, 0.75, na.rm = TRUE),
     .groups = "drop"
+  ) |>
+  mutate(
+    across(
+      c(median_depth_ft, q25_depth_ft, q75_depth_ft),
+      ~ if_else(is.nan(.x), NA_real_, .x)
+    )
   )
 
-readr::write_csv(depth_summary, "outputs/tables/depth_summary_by_era.csv")
+readr::write_csv(depth_summary, "outputs/tables/depth_summary_by_harmonized_site_era.csv")
 
-ggplot(sample_clades, aes(x = era, y = depth_ft)) +
-  geom_boxplot(outlier.shape = NA) +
-  geom_jitter(width = 0.15, alpha = 0.35, size = 1) +
-  facet_grid(collection_subregion ~ host_species_code, scales = "free_y") +
-  labs(x = NULL, y = "Collection depth (ft)") +
-  theme_classic()
+site_depth_order <- depth_summary |>
+  group_by(collection_subregion, collection_site_harmonized) |>
+  summarize(
+    site_n = sum(n),
+    median_site_depth_ft = median(median_depth_ft, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(collection_subregion, median_site_depth_ft, collection_site_harmonized) |>
+  pull(collection_site_harmonized) |>
+  unique()
 
-ggsave("outputs/figures/depth_by_era.png", width = 11, height = 7, dpi = 300)
+depth_summary_plot <- depth_summary |>
+  mutate(
+    collection_site_harmonized = factor(collection_site_harmonized, levels = site_depth_order),
+    site_plot_label = str_trunc(as.character(collection_site_harmonized), width = 36),
+    site_plot_label = factor(site_plot_label, levels = str_trunc(site_depth_order, width = 36)),
+    era = factor(era, levels = eras),
+    depth_label = if_else(n_depth > 0, as.character(n), paste0(n, "*"))
+  )
+
+ggplot(depth_summary_plot, aes(x = era, y = site_plot_label)) +
+  geom_tile(aes(fill = median_depth_ft), color = "white", linewidth = 0.35) +
+  geom_text(aes(label = depth_label), size = 2.6) +
+  facet_grid(
+    collection_subregion ~ host_species_code,
+    scales = "free_y",
+    space = "free_y"
+  ) +
+  scale_fill_viridis_c(
+    option = "C",
+    na.value = "grey90",
+    name = "Median depth (ft)"
+  ) +
+  labs(
+    x = NULL,
+    y = "Harmonized collection site",
+    caption = "Tile labels are sample counts; an asterisk marks rows with no usable depth values."
+  ) +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.ticks = element_blank()
+  )
+
+ggsave("outputs/figures/depth_by_harmonized_site_era.png", width = 12, height = 8, dpi = 300)
 ```
 
 # Symbiont composition
 
-For each subregion-by-species group, samples are binned by pooled depth. Within
-each era, samples are weighted so the era depth-bin distribution matches the
-pooled depth distribution for that subregion-by-species group. This preserves
-the observed samples while reducing bias from eras being sampled at different
-depths.
+For each subregion-by-species group, samples are weighted so each era better
+matches the pooled distribution of harmonized collection sites and, where
+available, pooled depth bins. This preserves the observed samples while reducing
+bias from eras being sampled at different sites or depths.
 
-Dry Tortugas samples are not depth-standardized because one era lacks depth
-information; for cross-era Dry Tortugas comparisons, all eras are therefore
-kept on the same non-depth-standardized scale. Other subregion-by-species groups
-without usable depth information are also kept and reported as
-non-depth-standardized mean composition.
+Dry Tortugas samples are site-standardized but not depth-standardized because
+one era lacks depth information. Other subregion-by-species groups without
+usable depth information are also retained and standardized only by the
+available design variables.
 
 Groups with fewer than `min_n` samples in an era are retained with `NA`
 composition for that era rather than silently dropped.
 
 ```{r standardized-composition}
-min_n <- 4
+min_n <- sample_filter_min_n
 
 composition_std <- standardized_era_composition(
-  sample_clades,
+  sample_clades_retained,
   min_n = min_n,
   n_bins = 6,
   no_depth_standardization_subregions = "Dry Tortugas"
 )
 
+standardization_targets <- standardization_target_distribution(
+  sample_clades_retained,
+  composition = composition_std,
+  n_bins = 6,
+  no_depth_standardization_subregions = "Dry Tortugas"
+)
+
+standardization_target_margins <- bind_rows(
+  standardization_targets |>
+    filter(!is.na(collection_site_harmonized)) |>
+    summarize(
+      n_target = sum(n_target),
+      target_total_n = first(target_total_n),
+      target_proportion = sum(target_proportion),
+      target_percent = 100 * target_proportion,
+      .by = c(collection_subregion, host_species_code, standardization_method, collection_site_harmonized)
+    ) |>
+    transmute(
+      collection_subregion, host_species_code, standardization_method,
+      target_variable = "site",
+      target_level = collection_site_harmonized,
+      n_target, target_total_n, target_proportion, target_percent
+    ),
+  standardization_targets |>
+    filter(!is.na(depth_bin)) |>
+    summarize(
+      n_target = sum(n_target),
+      target_total_n = first(target_total_n),
+      target_proportion = sum(target_proportion),
+      target_percent = 100 * target_proportion,
+      .by = c(collection_subregion, host_species_code, standardization_method, depth_bin)
+    ) |>
+    transmute(
+      collection_subregion, host_species_code, standardization_method,
+      target_variable = "depth_bin",
+      target_level = depth_bin,
+      n_target, target_total_n, target_proportion, target_percent
+    )
+) |>
+  arrange(collection_subregion, host_species_code, target_variable, desc(target_proportion), target_level)
+
 era_distances <- compare_eras(composition_std)
 
-readr::write_csv(composition_std, "data/processed/depth_standardized_composition.csv")
-readr::write_csv(era_distances, "outputs/tables/era_composition_distances.csv")
+across_region_composition <- combine_regions_by_species(
+  composition_std,
+  regions = c("Upper Keys", "Dry Tortugas"),
+  region_weighting = "equal"
+)
 
-composition_std |>
-  arrange(collection_subregion, host_species_code, era) |>
-  knitr::kable()
+across_region_distances <- compare_eras_by_species(across_region_composition)
+
+readr::write_csv(composition_std, "data/processed/site_depth_standardized_composition.csv")
+readr::write_csv(standardization_targets, "outputs/tables/composition_standardization_targets.csv")
+readr::write_csv(
+  standardization_target_margins,
+  "outputs/tables/composition_standardization_target_margins.csv"
+)
+readr::write_csv(era_distances, "outputs/tables/era_composition_distances.csv")
+readr::write_csv(
+  across_region_composition,
+  "data/processed/across_region_species_composition.csv"
+)
+readr::write_csv(
+  across_region_distances,
+  "outputs/tables/across_region_species_era_distances.csv"
+)
 ```
 
 ```{r composition-plot}
@@ -188,47 +497,30 @@ ggplot(composition_long, aes(x = era, y = proportion, fill = clade)) +
   facet_grid(collection_subregion + standardization_method ~ host_species_code) +
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
   labs(x = NULL, y = "Symbiont composition", fill = "Clade") +
-  theme_classic()
-
-ggsave("outputs/figures/depth_standardized_composition.png", width = 11, height = 7, dpi = 300)
-```
-
-```{r distance-plot}
-era_distances_plot <- era_distances |>
-  mutate(
-    contrast = factor(
-      paste(era1, "to", era2),
-      levels = c("2001-03 to 2019-21", "2019-21 to 2024", "2001-03 to 2024")
-    )
-  )
-
-ggplot(era_distances_plot, aes(x = contrast, y = Hellinger)) +
-  geom_col(width = 0.75) +
-  facet_grid(collection_subregion ~ host_species_code) +
-  labs(x = NULL, y = "Hellinger distance") +
   theme_classic() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
 
-ggsave("outputs/figures/era_hellinger_distances.png", width = 11, height = 7, dpi = 300)
+ggsave("outputs/figures/site_depth_standardized_composition.png", width = 13, height = 7, dpi = 300)
 ```
 
 # Statistical test
 
 The primary test is a PERMANOVA on clade composition within each
-subregion-by-species group. Groups with usable depth data are tested as:
+subregion-by-species group. Era is evaluated after available design terms, so
+groups with site and depth structure are tested as:
 
-`composition ~ era + depth_bin`
+`composition ~ depth_bin + site + era`
 
 Groups without usable depth data are kept and tested as:
 
-`composition ~ era`
+`composition ~ site + era`
 
 These tests are paired with the composition summaries above so the biological
 effect sizes are interpretable.
 
 ```{r permanova}
 permanova_results <- permanova_by_group(
-  sample_clades,
+  sample_clades_retained,
   min_n = min_n,
   permutations = 999,
   no_depth_adjustment_subregions = "Dry Tortugas"
@@ -236,20 +528,124 @@ permanova_results <- permanova_by_group(
 
 readr::write_csv(permanova_results, "outputs/tables/permanova_by_subregion_species.csv")
 
+format_p <- function(p) {
+  case_when(
+    is.na(p) ~ "",
+    p < 0.001 ~ "&lt;0.001***",
+    p < 0.01 ~ sprintf("%.3f**", p),
+    p < 0.05 ~ sprintf("%.3f*", p),
+    TRUE ~ sprintf("%.3f", p)
+  )
+}
+
+format_sig_p <- function(p) {
+  formatted <- format_p(p)
+  if_else(!is.na(p) & p < 0.05, paste0("<strong>", formatted, "</strong>"), formatted)
+}
+
 permanova_results |>
-  arrange(p_era) |>
-  knitr::kable()
+  arrange(host_species_code, collection_subregion) |>
+  select(-site_adjusted, -depth_adjusted) |>
+  mutate(
+    p_depth_bin = format_sig_p(p_depth_bin),
+    p_site = format_sig_p(p_site),
+    p_era = format_sig_p(p_era)
+  ) |>
+  knitr::kable(escape = FALSE)
 ```
 
-# ITS2 shifts versus experimental shuffling
+## Site/depth-standardized composition shifts
 
-The experimental shuffling coefficient table is joined by four-letter species
-code. Two comparisons are produced:
+Summarize pairwise era shifts using Hellinger distances calculated from the
+site/depth-standardized composition estimates above. Points include
+subregion-specific shifts and a species-level field summary that averages
+available subregions equally when more than one subregion is available.
 
-1. era-to-era ITS2 composition distance versus experimental shuffling
-   coefficient;
-2. depth-standardized 2024 ITS2 clade-D proportion versus experimental clade-D
-   proportion.
+```{r standardized-shift-plot}
+standardized_shift_plot_data <- bind_rows(
+  era_distances |>
+    filter(!is.na(Hellinger)) |>
+    transmute(
+      field_scale = collection_subregion,
+      host_species_code,
+      era1, era2,
+      Hellinger
+    ),
+  across_region_distances |>
+    filter(!is.na(Hellinger)) |>
+    transmute(
+      field_scale = "Species-level",
+      host_species_code,
+      era1, era2,
+      Hellinger
+    )
+) |>
+  mutate(
+    contrast = factor(
+      paste(era1, "to", era2),
+      levels = c("2001-03 to 2019-21", "2019-21 to 2024", "2001-03 to 2024")
+    ),
+    field_scale = factor(
+      field_scale,
+      levels = c("Species-level", "Upper Keys", "Dry Tortugas")
+    )
+  )
+
+standardized_shift_species_order <- standardized_shift_plot_data |>
+  summarize(max_hellinger = max(Hellinger), .by = host_species_code) |>
+  arrange(desc(max_hellinger)) |>
+  pull(host_species_code)
+
+standardized_shift_plot_data <- standardized_shift_plot_data |>
+  mutate(
+    host_species_code = factor(host_species_code, levels = standardized_shift_species_order)
+  )
+
+standardized_shift_plot <- ggplot(
+  standardized_shift_plot_data,
+  aes(x = host_species_code, y = Hellinger, color = contrast, shape = field_scale)
+) +
+  geom_point(
+    position = position_dodge(width = 0.55),
+    size = 2.8,
+    alpha = 0.85
+  ) +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.06))) +
+  labs(
+    x = "Host species",
+    y = "Hellinger distance",
+    color = "Era contrast",
+    shape = "Field scale",
+    title = "Site/depth-standardized symbiont composition shifts",
+    subtitle = "Species-level points weight available subregions equally; single-region species collapse to that region"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+standardized_shift_plot
+
+ggsave("outputs/figures/site_depth_standardized_hellinger_shifts_by_species.png", standardized_shift_plot, width = 11, height = 6.5, dpi = 300)
+```
+
+# Field shifts versus experimental shuffling
+
+The primary comparison asks whether species with stronger experimental
+shuffling responses also show larger field-measured shifts in symbiont
+composition. Because the experimental data are species-level rather than
+subregion-specific, the primary field response is the species-level
+site/depth-standardized Hellinger distance from `2019-21` to `2024`. Species
+with both Upper Keys and Dry Tortugas estimates are averaged across subregions;
+species with one available subregion use that subregion's standardized field
+estimate.
+
+The first table is a contrast-level screen: each row correlates the
+species-level field shift for one era contrast with the experimental shuffling
+coefficient. The `2019-21 to 2024` contrast is the direct comparison to the
+field samples collected closest to the experiment.
 
 ```{r experimental-comparison}
 experimental_shuffling <- load_experimental_shuffling(
@@ -262,118 +658,815 @@ experimental_comparison <- compare_its2_to_experimental(
   experimental = experimental_shuffling
 )
 
-readr::write_csv(
-  experimental_comparison$distance,
-  "outputs/tables/its2_distances_vs_experimental_shuffling.csv"
-)
-readr::write_csv(
-  experimental_comparison$composition,
-  "outputs/tables/its2_2024_clade_d_vs_experimental_prop_d.csv"
-)
-readr::write_csv(
-  experimental_comparison$distance_correlations,
-  "outputs/tables/correlations_its2_distances_vs_experimental_shuffling.csv"
-)
-readr::write_csv(
-  experimental_comparison$composition_correlations,
-  "outputs/tables/correlations_its2_2024_clade_d_vs_experimental_prop_d.csv"
+across_region_experimental <- compare_across_region_to_experimental(
+  composition = across_region_composition,
+  distances = across_region_distances,
+  experimental = experimental_shuffling
 )
 
-experimental_comparison$distance_correlations |>
-  arrange(collection_subregion, contrast) |>
-  knitr::kable()
+readr::write_csv(
+  across_region_experimental$distance,
+  "outputs/tables/across_region_its2_distances_vs_experimental_shuffling.csv"
+)
+readr::write_csv(
+  across_region_experimental$distance_correlations,
+  "outputs/tables/across_region_correlations_its2_distances_vs_experimental_shuffling.csv"
+)
+readr::write_csv(
+  across_region_experimental$composition,
+  "outputs/tables/across_region_its2_2024_clade_d_vs_experimental_prop_d.csv"
+)
+readr::write_csv(
+  across_region_experimental$composition_correlations,
+  "outputs/tables/across_region_correlations_its2_2024_clade_d_vs_experimental_prop_d.csv"
+)
 
-experimental_comparison$composition_correlations |>
-  arrange(collection_subregion) |>
-  knitr::kable()
+across_region_experimental$distance_correlations |>
+  arrange(contrast) |>
+  knitr::kable(
+    digits = 3,
+    caption = paste(
+      "Pearson correlations between species-level field Hellinger distance",
+      "and experimental shuffling coefficient. Each row uses one era contrast;",
+      "the 2019-21 to 2024 contrast is the primary comparison."
+    )
+  )
 ```
 
-```{r experimental-distance-plot}
-experimental_distance_plot <- experimental_comparison$distance |>
+```{r experimental-field-shift-plot}
+estimate_hellinger_response_se <- function(composition, distance_data, n_boot = 1000, seed = 20240630) {
+  set.seed(seed)
+
+  map_dfr(seq_len(nrow(distance_data)), \(i) {
+    row <- distance_data[i, ]
+    p1 <- composition |>
+      filter(host_species_code == row$species_code, era == row$era1)
+    p2 <- composition |>
+      filter(host_species_code == row$species_code, era == row$era2)
+
+    if (
+      nrow(p1) != 1 || nrow(p2) != 1 ||
+        anyNA(select(p1, all_of(clades))) || anyNA(select(p2, all_of(clades))) ||
+        is.na(row$n1) || is.na(row$n2) || row$n1 <= 0 || row$n2 <= 0
+    ) {
+      return(tibble(species_code = row$species_code, contrast = row$contrast, Hellinger_se = NA_real_))
+    }
+
+    p1_vector <- as.numeric(select(p1, all_of(clades)))
+    p2_vector <- as.numeric(select(p2, all_of(clades)))
+    p1_draws <- t(rmultinom(n_boot, size = row$n1, prob = p1_vector)) / row$n1
+    p2_draws <- t(rmultinom(n_boot, size = row$n2, prob = p2_vector)) / row$n2
+
+    tibble(
+      species_code = row$species_code,
+      contrast = row$contrast,
+      Hellinger_se = sd(map2_dbl(
+        seq_len(n_boot),
+        seq_len(n_boot),
+        \(j, k) hellinger_distance(p1_draws[j, ], p2_draws[k, ])
+      ))
+    )
+  })
+}
+
+experimental_field_shift_plot_data <- across_region_experimental$distance |>
   filter(
     contrast == "2019-21 to 2024",
     !is.na(mean_shuff_coef),
     !is.na(Hellinger)
+  ) |>
+  left_join(
+    estimate_hellinger_response_se(across_region_composition, across_region_experimental$distance),
+    by = c("species_code", "contrast")
+  ) |>
+  mutate(
+    harmonic_field_n = 2 / (1 / n1 + 1 / n2),
+    response_weight = 1 / Hellinger_se^2
   )
 
-ggplot(experimental_distance_plot, aes(x = mean_shuff_coef, y = Hellinger)) +
-  geom_point(aes(size = experimental_n), alpha = 0.75) +
-  geom_smooth(method = "lm", se = TRUE, linewidth = 0.6) +
+fit_lm_unweighted <- lm(Hellinger ~ mean_shuff_coef, data = experimental_field_shift_plot_data)
+fit_lm_weighted <- lm(
+  Hellinger ~ mean_shuff_coef,
+  data = experimental_field_shift_plot_data,
+  weights = response_weight
+)
+fit_rlm <- MASS::rlm(Hellinger ~ mean_shuff_coef, data = experimental_field_shift_plot_data)
+
+summarize_lm_shift_model <- function(fit, method, fit_scale = "Raw Hellinger") {
+  fit_summary <- summary(fit)
+  tibble(
+    method = method,
+    fit_scale = fit_scale,
+    n_species = length(fitted(fit)),
+    intercept = coef(fit)[["(Intercept)"]],
+    slope = coef(fit)[["mean_shuff_coef"]],
+    slope_se = fit_summary$coefficients["mean_shuff_coef", "Std. Error"],
+    slope_p = fit_summary$coefficients["mean_shuff_coef", "Pr(>|t|)"],
+    r_squared = fit_summary$r.squared
+  )
+}
+
+summarize_rlm_shift_model <- function(fit, method, fit_scale = "Raw Hellinger") {
+  fit_summary <- summary(fit)
+  slope <- fit_summary$coefficients["mean_shuff_coef", "Value"]
+  slope_se <- fit_summary$coefficients["mean_shuff_coef", "Std. Error"]
+  slope_t <- slope / slope_se
+  n_species <- length(fitted(fit))
+  observed <- model.response(model.frame(fit))
+
+  tibble(
+    method = method,
+    fit_scale = fit_scale,
+    n_species = n_species,
+    intercept = coef(fit)[["(Intercept)"]],
+    slope = slope,
+    slope_se = slope_se,
+    slope_p = 2 * pt(abs(slope_t), df = n_species - 2, lower.tail = FALSE),
+    r_squared = 1 - sum(resid(fit)^2) / sum((observed - mean(observed))^2)
+  )
+}
+
+experimental_shift_model_comparison <- bind_rows(
+  summarize_lm_shift_model(fit_lm_unweighted, "Unweighted LM"),
+  summarize_lm_shift_model(fit_lm_weighted, "Weighted LM (response SE)"),
+  summarize_rlm_shift_model(fit_rlm, "Robust regression")
+) |>
+  mutate(slope_p_formatted = format_sig_p(slope_p))
+
+experimental_shift_model_comparison |>
+  select(method, fit_scale, n_species, intercept, slope, slope_se, slope_p = slope_p_formatted, r_squared) |>
+  knitr::kable(
+    digits = 3,
+    escape = FALSE,
+    caption = "Model comparison for the primary 2019-21 to 2024 field shift versus experimental shuffling coefficient. R-squared is ordinary R-squared for linear models and deviance pseudo-R-squared for fractional-logit models."
+  )
+
+experimental_shift_prediction_grid <- tibble(
+  mean_shuff_coef = seq(
+    min(experimental_field_shift_plot_data$mean_shuff_coef),
+    max(experimental_field_shift_plot_data$mean_shuff_coef),
+    length.out = 100
+  )
+)
+
+experimental_shift_model_lines <- bind_rows(
+  experimental_shift_prediction_grid |>
+    mutate(
+      method = "Unweighted LM",
+      Hellinger = predict(fit_lm_unweighted, newdata = experimental_shift_prediction_grid)
+    ),
+  experimental_shift_prediction_grid |>
+    mutate(
+      method = "Weighted LM (response SE)",
+      Hellinger = predict(fit_lm_weighted, newdata = experimental_shift_prediction_grid)
+    ),
+  experimental_shift_prediction_grid |>
+    mutate(
+      method = "Robust regression",
+      Hellinger = predict(fit_rlm, newdata = experimental_shift_prediction_grid)
+    )
+  ) |>
+  mutate(method = factor(method, levels = experimental_shift_model_comparison$method))
+
+experimental_field_shift_plot <- ggplot(
+  experimental_field_shift_plot_data,
+  aes(x = mean_shuff_coef, y = Hellinger)
+) +
+  geom_errorbar(
+    aes(ymin = pmax(0, Hellinger - Hellinger_se), ymax = pmin(1, Hellinger + Hellinger_se)),
+    width = 0,
+    alpha = 0.45
+  ) +
+  geom_point(size = 3, alpha = 0.75) +
+  geom_line(
+    data = experimental_shift_model_lines,
+    aes(y = Hellinger, color = method, linetype = method),
+    linewidth = 0.7
+  ) +
   geom_text(
     aes(label = species_code),
     nudge_y = 0.02,
     check_overlap = TRUE,
     size = 3
   ) +
-  facet_wrap(~ collection_subregion) +
   labs(
     x = "Experimental shuffling coefficient",
-    y = "ITS2 Hellinger distance (2019-21 to 2024)",
-    size = "Experimental n"
+    y = "Species-level ITS2 Hellinger distance (2019-21 to 2024)",
+    color = "Model",
+    linetype = "Model"
   ) +
   theme_classic()
 
-ggsave("outputs/figures/its2_distance_vs_experimental_shuffling.png", width = 9, height = 5, dpi = 300)
+experimental_field_shift_plot
+
+ggsave("outputs/figures/across_region_its2_distance_vs_experimental_shuffling.png", experimental_field_shift_plot, width = 8, height = 5, dpi = 300)
+```
+
+## Secondary Durusdinium endpoint comparison
+
+The shuffling-coefficient analysis above focuses on whether experimental
+response strength predicts the magnitude of field ITS2 shifts. As a separate
+endpoint check, the table and plot below compare the final Durusdinium proportions
+measured in the experiment with the species-level 2024 field Durusdinium
+proportions.
+
+```{r experimental-clade-d-table}
+across_region_experimental$composition_correlations |>
+  knitr::kable(
+    digits = 3,
+    caption = "Pearson correlation between species-level 2024 ITS2 Durusdinium proportion and experimental Durusdinium proportion"
+  )
 ```
 
 ```{r experimental-clade-d-plot}
-experimental_clade_d_plot <- experimental_comparison$composition |>
-  filter(!is.na(mean_prop_d), !is.na(its2_prop_d_2024))
+experimental_clade_d_plot <- across_region_experimental$composition |>
+  filter(!is.na(mean_prop_d), !is.na(its2_prop_d_2024)) |>
+  mutate(
+    field_n = n_its2_2024,
+    its2_prop_d_2024_count = its2_prop_d_2024 * n_its2_2024,
+    its2_prop_d_2024_adjusted = (its2_prop_d_2024_count + 0.5) / (n_its2_2024 + 1),
+    its2_prop_d_2024_se = sqrt(
+      its2_prop_d_2024_adjusted * (1 - its2_prop_d_2024_adjusted) / (n_its2_2024 + 1)
+    ),
+    response_weight = 1 / its2_prop_d_2024_se^2
+  )
 
-ggplot(experimental_clade_d_plot, aes(x = mean_prop_d, y = its2_prop_d_2024)) +
+fit_clade_d_lm_unweighted <- lm(its2_prop_d_2024 ~ mean_prop_d, data = experimental_clade_d_plot)
+fit_clade_d_lm_weighted <- lm(
+  its2_prop_d_2024 ~ mean_prop_d,
+  data = experimental_clade_d_plot,
+  weights = response_weight
+)
+fit_clade_d_rlm <- MASS::rlm(its2_prop_d_2024 ~ mean_prop_d, data = experimental_clade_d_plot)
+
+summarize_clade_d_lm <- function(fit, method) {
+  fit_summary <- summary(fit)
+  tibble(
+    method = method,
+    n_species = length(fitted(fit)),
+    intercept = coef(fit)[["(Intercept)"]],
+    slope = coef(fit)[["mean_prop_d"]],
+    slope_se = fit_summary$coefficients["mean_prop_d", "Std. Error"],
+    slope_p = fit_summary$coefficients["mean_prop_d", "Pr(>|t|)"],
+    r_squared = fit_summary$r.squared
+  )
+}
+
+summarize_clade_d_rlm <- function(fit, method) {
+  fit_summary <- summary(fit)
+  slope <- fit_summary$coefficients["mean_prop_d", "Value"]
+  slope_se <- fit_summary$coefficients["mean_prop_d", "Std. Error"]
+  slope_t <- slope / slope_se
+  n_species <- length(fitted(fit))
+  observed <- model.response(model.frame(fit))
+
+  tibble(
+    method = method,
+    n_species = n_species,
+    intercept = coef(fit)[["(Intercept)"]],
+    slope = slope,
+    slope_se = slope_se,
+    slope_p = 2 * pt(abs(slope_t), df = n_species - 2, lower.tail = FALSE),
+    r_squared = 1 - sum(resid(fit)^2) / sum((observed - mean(observed))^2)
+  )
+}
+
+experimental_clade_d_model_comparison <- bind_rows(
+  summarize_clade_d_lm(fit_clade_d_lm_unweighted, "Unweighted LM"),
+  summarize_clade_d_lm(fit_clade_d_lm_weighted, "Weighted LM (response SE)"),
+  summarize_clade_d_rlm(fit_clade_d_rlm, "Robust regression")
+) |>
+  mutate(slope_p_formatted = format_sig_p(slope_p))
+
+experimental_clade_d_model_comparison |>
+  select(method, n_species, intercept, slope, slope_se, slope_p = slope_p_formatted, r_squared) |>
+  knitr::kable(
+    digits = 3,
+    escape = FALSE,
+    caption = "Model comparison for species-level 2024 ITS2 Durusdinium proportion versus experimental Durusdinium proportion"
+  )
+
+experimental_clade_d_prediction_grid <- tibble(
+  mean_prop_d = seq(
+    min(experimental_clade_d_plot$mean_prop_d),
+    max(experimental_clade_d_plot$mean_prop_d),
+    length.out = 100
+  )
+)
+
+experimental_clade_d_model_lines <- bind_rows(
+  experimental_clade_d_prediction_grid |>
+    mutate(
+      method = "Unweighted LM",
+      its2_prop_d_2024 = predict(fit_clade_d_lm_unweighted, newdata = experimental_clade_d_prediction_grid)
+    ),
+  experimental_clade_d_prediction_grid |>
+    mutate(
+      method = "Weighted LM (response SE)",
+      its2_prop_d_2024 = predict(fit_clade_d_lm_weighted, newdata = experimental_clade_d_prediction_grid)
+    ),
+  experimental_clade_d_prediction_grid |>
+    mutate(
+      method = "Robust regression",
+      its2_prop_d_2024 = predict(fit_clade_d_rlm, newdata = experimental_clade_d_prediction_grid)
+    )
+) |>
+  mutate(method = factor(method, levels = experimental_clade_d_model_comparison$method))
+
+experimental_clade_d_plot_out <- ggplot(experimental_clade_d_plot, aes(x = mean_prop_d, y = its2_prop_d_2024)) +
   geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey55") +
-  geom_point(aes(size = experimental_n), alpha = 0.75) +
-  geom_smooth(method = "lm", se = TRUE, linewidth = 0.6) +
+  geom_errorbar(
+    aes(ymin = pmax(0, its2_prop_d_2024 - its2_prop_d_2024_se), ymax = pmin(1, its2_prop_d_2024 + its2_prop_d_2024_se)),
+    width = 0,
+    alpha = 0.45
+  ) +
+  geom_point(size = 3, alpha = 0.75) +
+  geom_line(
+    data = experimental_clade_d_model_lines,
+    aes(y = its2_prop_d_2024, color = method, linetype = method),
+    linewidth = 0.7
+  ) +
   geom_text(
     aes(label = species_code),
     nudge_y = 0.02,
     check_overlap = TRUE,
     size = 3
   ) +
-  facet_wrap(~ collection_subregion) +
   coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
   scale_x_continuous(labels = scales::percent_format()) +
   scale_y_continuous(labels = scales::percent_format()) +
   labs(
-    x = "Experimental clade-D proportion",
-    y = "Depth-standardized 2024 ITS2 clade-D proportion",
-    size = "Experimental n"
+    x = "Experimental Durusdinium proportion",
+    y = "Species-level 2024 ITS2 Durusdinium proportion",
+    color = "Model",
+    linetype = "Model"
   ) +
   theme_classic()
 
-ggsave("outputs/figures/its2_2024_clade_d_vs_experimental_prop_d.png", width = 9, height = 5, dpi = 300)
+experimental_clade_d_plot_out
+
+ggsave("outputs/figures/across_region_its2_2024_clade_d_vs_experimental_prop_d.png", experimental_clade_d_plot_out, width = 8, height = 5, dpi = 300)
+```
+
+## Integrated experimental comparison
+
+The polished synthesis treats the shuffling coefficient as the primary
+experimental predictor of field composition-shift magnitude, and the Durusdinium
+proportion comparison as a secondary endpoint check. The combined figure keeps
+the two analyses side-by-side with consistent model display and point-size
+weights. Figure lines and 95% confidence bands show weighted fractional-logit
+models implemented as quasibinomial GLMs with a logit link and inverse-variance
+weights from the field response estimates. For the Hellinger-distance response,
+SE is estimated by parametric multinomial bootstrap from the two field
+composition estimates; for the 2024 Durusdinium endpoint, SE is approximated from
+the 2024 field proportion and sample size using a continuity correction so
+observed proportions of exactly 0 or 1 do not receive infinite weight. This is a quasi-likelihood mean model for bounded
+responses rather than a literal binomial sampling model, which is appropriate
+here because both field responses are continuous species-level summaries rather
+than counts of successes and failures. The logit link keeps predicted means and
+confidence bands inside the 0-1 response scale. Linear and robust fits are
+retained as sensitivity checks in the table below.
+
+```{r integrated-experimental-model-table}
+fit_shift_fractional_logit_weighted <- glm(
+  Hellinger ~ mean_shuff_coef,
+  data = experimental_field_shift_plot_data,
+  weights = response_weight,
+  family = quasibinomial(link = "logit")
+)
+
+fit_clade_d_fractional_logit_weighted <- glm(
+  its2_prop_d_2024 ~ mean_prop_d,
+  data = experimental_clade_d_plot,
+  weights = response_weight,
+  family = quasibinomial(link = "logit")
+)
+
+summarize_weighted_fractional_logit <- function(fit, method, slope_name) {
+  fit_summary <- summary(fit)
+  p_column <- grep("^Pr", colnames(fit_summary$coefficients), value = TRUE)
+
+  tibble(
+    method = method,
+    model_family = "Quasibinomial GLM, logit link",
+    n_species = length(fitted(fit)),
+    intercept = coef(fit)[["(Intercept)"]],
+    slope = coef(fit)[[slope_name]],
+    slope_se = fit_summary$coefficients[slope_name, "Std. Error"],
+    slope_p = fit_summary$coefficients[slope_name, p_column],
+    r_squared = 1 - fit$deviance / fit$null.deviance
+  ) |>
+    mutate(slope_p_formatted = format_sig_p(slope_p))
+}
+
+integrated_experimental_model_comparison <- bind_rows(
+  summarize_weighted_fractional_logit(
+    fit_shift_fractional_logit_weighted,
+    "Weighted fractional logit (response SE)",
+    "mean_shuff_coef"
+  ) |>
+    mutate(
+      endpoint = "Composition-shift magnitude",
+      predictor = "Experimental shuffling coefficient",
+      response = "2019-21 to 2024 Hellinger distance",
+      model_role = "Displayed bounded model"
+    ),
+  experimental_shift_model_comparison |>
+    mutate(
+      endpoint = "Composition-shift magnitude",
+      predictor = "Experimental shuffling coefficient",
+      response = "2019-21 to 2024 Hellinger distance",
+      model_family = "Gaussian/robust linear",
+      model_role = "Sensitivity check"
+    ),
+  summarize_weighted_fractional_logit(
+    fit_clade_d_fractional_logit_weighted,
+    "Weighted fractional logit (response SE)",
+    "mean_prop_d"
+  ) |>
+    mutate(
+      endpoint = "Durusdinium endpoint",
+      predictor = "Experimental Durusdinium proportion",
+      response = "2024 ITS2 Durusdinium proportion",
+      model_role = "Displayed bounded model"
+    ),
+  experimental_clade_d_model_comparison |>
+    mutate(
+      endpoint = "Durusdinium endpoint",
+      predictor = "Experimental Durusdinium proportion",
+      response = "2024 ITS2 Durusdinium proportion",
+      model_family = "Gaussian/robust linear",
+      model_role = "Sensitivity check"
+    )
+) |>
+  mutate(
+    endpoint = factor(endpoint, levels = c("Composition-shift magnitude", "Durusdinium endpoint")),
+    model_role = factor(model_role, levels = c("Displayed bounded model", "Sensitivity check")),
+    method = factor(
+      method,
+      levels = c(
+        "Weighted fractional logit (response SE)",
+        "Unweighted LM",
+        "Weighted LM (response SE)",
+        "Robust regression"
+      )
+    )
+  ) |>
+  select(
+    endpoint, predictor, response, model_role, method, model_family, n_species,
+    intercept, slope, slope_se, slope_p = slope_p_formatted, r_squared
+  )
+
+integrated_experimental_model_comparison |>
+  arrange(endpoint, model_role, method) |>
+  knitr::kable(
+    digits = 3,
+    escape = FALSE,
+    caption = "Integrated experimental-to-field model comparison. Quasibinomial/fractional-logit models are displayed in the figure because the response variables are bounded from 0 to 1; linear and robust fits are sensitivity checks."
+  )
+```
+
+```{r integrated-experimental-leave-one-out}
+summarize_fractional_logit_fit <- function(fit, slope_name) {
+  fit_summary <- summary(fit)
+  p_column <- grep("^Pr", colnames(fit_summary$coefficients), value = TRUE)
+
+  tibble(
+    n_species = length(fitted(fit)),
+    slope = coef(fit)[[slope_name]],
+    slope_se = fit_summary$coefficients[slope_name, "Std. Error"],
+    slope_p = fit_summary$coefficients[slope_name, p_column],
+    pseudo_r2 = 1 - fit$deviance / fit$null.deviance
+  )
+}
+
+leave_one_species_out_fractional_logit <- function(data, endpoint, response_col, predictor_col, weight_col) {
+  formula <- reformulate(predictor_col, response_col)
+  data <- mutate(data, .model_weight = .data[[weight_col]])
+  full_fit <- glm(
+    formula,
+    data = data,
+    weights = .model_weight,
+    family = quasibinomial(link = "logit")
+  )
+
+  bind_rows(
+    summarize_fractional_logit_fit(full_fit, predictor_col) |>
+      mutate(endpoint = endpoint, omitted_species = "None"),
+    map_dfr(sort(unique(data$species_code)), \(species_i) {
+      fit_data <- filter(data, species_code != species_i)
+      fit <- glm(
+        formula,
+        data = fit_data,
+        weights = .model_weight,
+        family = quasibinomial(link = "logit")
+      )
+
+      summarize_fractional_logit_fit(fit, predictor_col) |>
+        mutate(endpoint = endpoint, omitted_species = species_i)
+    })
+  ) |>
+    mutate(
+      endpoint = factor(endpoint, levels = c("Composition-shift magnitude", "Durusdinium endpoint")),
+      slope_p_formatted = format_sig_p(slope_p)
+    )
+}
+
+integrated_experimental_leave_one_out <- bind_rows(
+  leave_one_species_out_fractional_logit(
+    experimental_field_shift_plot_data,
+    endpoint = "Composition-shift magnitude",
+    response_col = "Hellinger",
+    predictor_col = "mean_shuff_coef",
+    weight_col = "response_weight"
+  ),
+  leave_one_species_out_fractional_logit(
+    experimental_clade_d_plot,
+    endpoint = "Durusdinium endpoint",
+    response_col = "its2_prop_d_2024",
+    predictor_col = "mean_prop_d",
+    weight_col = "response_weight"
+  )
+)
+
+integrated_experimental_leave_one_out |>
+  arrange(endpoint, omitted_species) |>
+  select(endpoint, omitted_species, n_species, slope, slope_se, slope_p = slope_p_formatted, pseudo_r2) |>
+  knitr::kable(
+    digits = 3,
+    escape = FALSE,
+    caption = "Leave-one-species-out sensitivity for the displayed response-SE weighted quasibinomial models"
+  )
+
+leave_one_out_reference <- integrated_experimental_leave_one_out |>
+  filter(omitted_species == "None") |>
+  select(endpoint, full_slope = slope)
+
+leave_one_out_plot_data <- integrated_experimental_leave_one_out |>
+  filter(omitted_species != "None") |>
+  left_join(leave_one_out_reference, by = "endpoint") |>
+  mutate(
+    slope_lwr = slope - 1.96 * slope_se,
+    slope_upr = slope + 1.96 * slope_se,
+    omitted_species = fct_reorder(omitted_species, slope)
+  )
+
+leave_one_out_plot <- ggplot(
+  leave_one_out_plot_data,
+  aes(x = omitted_species, y = slope)
+) +
+  geom_hline(aes(yintercept = full_slope), color = "#1f78b4", linewidth = 0.8) +
+  geom_errorbar(aes(ymin = slope_lwr, ymax = slope_upr), width = 0, alpha = 0.55) +
+  geom_point(size = 2.7, alpha = 0.85) +
+  coord_flip() +
+  facet_wrap(~ endpoint, scales = "free_x") +
+  labs(
+    x = "Species omitted",
+    y = "Quasibinomial slope estimate",
+    caption = "Blue line is the full-data slope; intervals are approximate +/- 1.96 SE from each leave-one-out fit."
+  ) +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    plot.caption = element_text(color = "grey30", hjust = 0)
+  )
+
+leave_one_out_plot
+
+ggsave(
+  "outputs/figures/integrated_experimental_leave_one_species_out.png",
+  leave_one_out_plot,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+```
+
+```{r integrated-experimental-comparison-figure}
+predict_fractional_logit_ci <- function(fit, newdata) {
+  prediction <- predict(fit, newdata = newdata, type = "link", se.fit = TRUE)
+  critical_value <- qt(0.975, df = fit$df.residual)
+
+  bind_cols(
+    newdata,
+    tibble(
+      fit = plogis(prediction$fit),
+      lwr = plogis(prediction$fit - critical_value * prediction$se.fit),
+      upr = plogis(prediction$fit + critical_value * prediction$se.fit)
+    )
+  )
+}
+
+weighted_shift_predictions <- predict_fractional_logit_ci(
+  fit_shift_fractional_logit_weighted,
+  experimental_shift_prediction_grid
+)
+
+weighted_clade_d_predictions <- predict_fractional_logit_ci(
+  fit_clade_d_fractional_logit_weighted,
+  experimental_clade_d_prediction_grid
+)
+
+publication_theme <- theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 10, color = "grey20"),
+    legend.position = "bottom",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    plot.margin = margin(6, 8, 6, 8)
+  )
+
+fit_color <- "#1f78b4"
+point_color <- "grey20"
+uncertainty_fill <- "#a6cee3"
+
+species_label_style <- list(
+  seed = 2,
+  size = 3,
+  min.segment.length = 0,
+  segment.color = "grey65",
+  segment.size = 0.25,
+  box.padding = 0.25,
+  point.padding = 0.22,
+  max.overlaps = Inf
+)
+
+experimental_shift_summary_panel <- ggplot(
+  experimental_field_shift_plot_data,
+  aes(x = mean_shuff_coef, y = Hellinger)
+) +
+  geom_ribbon(
+    data = weighted_shift_predictions,
+    aes(x = mean_shuff_coef, ymin = lwr, ymax = upr),
+    inherit.aes = FALSE,
+    fill = uncertainty_fill,
+    alpha = 0.32
+  ) +
+  geom_errorbar(
+    aes(ymin = pmax(0, Hellinger - Hellinger_se), ymax = pmin(1, Hellinger + Hellinger_se)),
+    width = 0,
+    color = "grey35",
+    alpha = 0.55
+  ) +
+  geom_line(
+    data = weighted_shift_predictions,
+    aes(y = fit),
+    color = fit_color,
+    linewidth = 0.9
+  ) +
+  geom_point(size = 3, color = point_color, alpha = 0.8) +
+  do.call(
+    ggrepel::geom_text_repel,
+    c(list(mapping = aes(label = species_code)), species_label_style)
+  ) +
+  scale_x_continuous(limits = c(0, 1), expand = expansion(mult = 0.02)) +
+  scale_y_continuous(limits = c(0, 1), expand = expansion(mult = 0.02)) +
+  labs(
+    title = "A. Field ITS2 composition shift",
+    x = "Experimental shuffling coefficient",
+    y = "Species-level Hellinger distance\n(2019-21 to 2024)"
+  ) +
+  publication_theme
+
+experimental_clade_d_summary_panel <- ggplot(
+  experimental_clade_d_plot,
+  aes(x = mean_prop_d, y = its2_prop_d_2024)
+) +
+  geom_ribbon(
+    data = weighted_clade_d_predictions,
+    aes(x = mean_prop_d, ymin = lwr, ymax = upr),
+    inherit.aes = FALSE,
+    fill = uncertainty_fill,
+    alpha = 0.32
+  ) +
+  geom_errorbar(
+    aes(ymin = pmax(0, its2_prop_d_2024 - its2_prop_d_2024_se), ymax = pmin(1, its2_prop_d_2024 + its2_prop_d_2024_se)),
+    width = 0,
+    color = "grey35",
+    alpha = 0.55
+  ) +
+  geom_line(
+    data = weighted_clade_d_predictions,
+    aes(y = fit),
+    color = fit_color,
+    linewidth = 0.9
+  ) +
+  geom_point(size = 3, color = point_color, alpha = 0.8) +
+  do.call(
+    ggrepel::geom_text_repel,
+    c(list(mapping = aes(label = species_code)), species_label_style)
+  ) +
+  scale_x_continuous(labels = scales::percent_format(), limits = c(0, 1), expand = expansion(mult = 0.02)) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1), expand = expansion(mult = 0.02)) +
+  labs(
+    title = "B. Field Durusdinium endpoint",
+    x = "Experimental Durusdinium proportion",
+    y = "Species-level 2024 ITS2\nDurusdinium proportion"
+  ) +
+  publication_theme
+
+integrated_experimental_comparison_plot <-
+  patchwork::wrap_plots(
+    experimental_shift_summary_panel,
+    experimental_clade_d_summary_panel,
+    widths = c(1, 1),
+    guides = "collect"
+  ) &
+  theme(legend.position = "bottom")
+
+integrated_experimental_comparison_plot
+
+ggsave(
+  "outputs/figures/integrated_experimental_field_comparison.png",
+  integrated_experimental_comparison_plot,
+  width = 12,
+  height = 5.5,
+  dpi = 300
+)
+
+ggsave(
+  "outputs/figures/integrated_experimental_field_comparison_quasibinomial.png",
+  integrated_experimental_comparison_plot,
+  width = 12,
+  height = 5.5,
+  dpi = 300
+)
+```
+
+```{r field-response-se-diagnostic}
+field_response_se_diagnostic <- bind_rows(
+  experimental_field_shift_plot_data |>
+    transmute(
+      endpoint = "Hellinger shift",
+      species_code,
+      field_sample_support = harmonic_field_n,
+      response_se = Hellinger_se
+    ),
+  experimental_clade_d_plot |>
+    transmute(
+      endpoint = "2024 Durusdinium proportion",
+      species_code,
+      field_sample_support = field_n,
+      response_se = its2_prop_d_2024_se
+    )
+) |>
+  mutate(endpoint = factor(endpoint, levels = c("Hellinger shift", "2024 Durusdinium proportion")))
+
+field_response_se_diagnostic_plot <- ggplot(
+  field_response_se_diagnostic,
+  aes(x = field_sample_support, y = response_se)
+) +
+  geom_point(size = 3, alpha = 0.8) +
+  ggrepel::geom_text_repel(
+    aes(label = species_code),
+    seed = 2,
+    size = 3,
+    min.segment.length = 0,
+    segment.color = "grey65",
+    segment.size = 0.25,
+    box.padding = 0.25,
+    point.padding = 0.22,
+    max.overlaps = Inf
+  ) +
+  facet_wrap(~ endpoint, scales = "free_x") +
+  labs(
+    x = "Field sample support",
+    y = "Field response SE",
+    caption = "Hellinger support is the harmonic mean of the two era sample sizes; Durusdinium support is the 2024 ITS2 sample size."
+  ) +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    plot.caption = element_text(color = "grey30", hjust = 0)
+  )
+
+field_response_se_diagnostic_plot
+
+ggsave(
+  "outputs/figures/field_response_se_vs_sample_support.png",
+  field_response_se_diagnostic_plot,
+  width = 9,
+  height = 4.5,
+  dpi = 300
+)
 ```
 
 # Across-region synthesis
 
 This section combines Upper Keys and Dry Tortugas into one species-level view.
-The inputs are the region-level compositions above: Upper Keys is
-depth-standardized where possible, and Dry Tortugas is treated as
-design-standardized by repeated site sampling and therefore not
-depth-standardized.
+The inputs are the region-level compositions above: Upper Keys is standardized
+by site and depth where possible, and Dry Tortugas is standardized by site but
+not by depth because depth data are incomplete.
 
 Regions are weighted equally when both regions are available for a species and
 era. This is intended as an across-region biological synthesis rather than a
 sample-size-weighted summary dominated by the region with more samples.
 
 ```{r across-region-composition}
-across_region_composition <- combine_regions_by_species(
-  composition_std,
-  regions = c("Upper Keys", "Dry Tortugas"),
-  region_weighting = "equal"
-)
-
-across_region_distances <- compare_eras_by_species(across_region_composition)
-
-readr::write_csv(
-  across_region_composition,
-  "data/processed/across_region_species_composition.csv"
-)
-readr::write_csv(
-  across_region_distances,
-  "outputs/tables/across_region_species_era_distances.csv"
-)
-
 across_region_composition |>
   arrange(host_species_code, era) |>
   knitr::kable()
@@ -405,103 +1498,6 @@ ggsave(
   across_region_composition_plot,
   width = 11,
   height = 7,
-  dpi = 300
-)
-```
-
-```{r across-region-experimental-comparison}
-across_region_experimental <- compare_across_region_to_experimental(
-  composition = across_region_composition,
-  distances = across_region_distances,
-  experimental = experimental_shuffling
-)
-
-readr::write_csv(
-  across_region_experimental$distance,
-  "outputs/tables/across_region_its2_distances_vs_experimental_shuffling.csv"
-)
-readr::write_csv(
-  across_region_experimental$composition,
-  "outputs/tables/across_region_its2_2024_clade_d_vs_experimental_prop_d.csv"
-)
-readr::write_csv(
-  across_region_experimental$distance_correlations,
-  "outputs/tables/across_region_correlations_its2_distances_vs_experimental_shuffling.csv"
-)
-readr::write_csv(
-  across_region_experimental$composition_correlations,
-  "outputs/tables/across_region_correlations_its2_2024_clade_d_vs_experimental_prop_d.csv"
-)
-
-across_region_experimental$distance_correlations |>
-  arrange(contrast) |>
-  knitr::kable()
-
-across_region_experimental$composition_correlations |>
-  knitr::kable()
-```
-
-```{r across-region-distance-experimental-plot}
-across_region_distance_plot <- across_region_experimental$distance |>
-  filter(
-    contrast == "2019-21 to 2024",
-    !is.na(mean_shuff_coef),
-    !is.na(Hellinger)
-  )
-
-ggplot(across_region_distance_plot, aes(x = mean_shuff_coef, y = Hellinger)) +
-  geom_point(aes(size = experimental_n), alpha = 0.75) +
-  geom_smooth(method = "lm", se = TRUE, linewidth = 0.6) +
-  geom_text(
-    aes(label = species_code),
-    nudge_y = 0.02,
-    check_overlap = TRUE,
-    size = 3
-  ) +
-  labs(
-    x = "Experimental shuffling coefficient",
-    y = "Across-region ITS2 Hellinger distance (2019-21 to 2024)",
-    size = "Experimental n"
-  ) +
-  theme_classic() +
-  ggpubr::stat_cor()
-
-ggsave(
-  "outputs/figures/across_region_its2_distance_vs_experimental_shuffling.png",
-  width = 8,
-  height = 5,
-  dpi = 300
-)
-```
-
-```{r across-region-clade-d-experimental-plot}
-across_region_clade_d_plot <- across_region_experimental$composition |>
-  filter(!is.na(mean_prop_d), !is.na(its2_prop_d_2024))
-
-ggplot(across_region_clade_d_plot, aes(x = mean_prop_d, y = its2_prop_d_2024)) +
-  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey55") +
-  geom_point(aes(size = experimental_n), alpha = 0.75) +
-  geom_smooth(method = "lm", se = TRUE, linewidth = 0.6) +
-  geom_text(
-    aes(label = species_code),
-    nudge_y = 0.02,
-    check_overlap = TRUE,
-    size = 3
-  ) +
-  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
-  scale_x_continuous(labels = scales::percent_format()) +
-  scale_y_continuous(labels = scales::percent_format()) +
-  labs(
-    x = "Experimental clade-D proportion",
-    y = "Across-region 2024 ITS2 clade-D proportion",
-    size = "Experimental n"
-  ) +
-  theme_classic()
-
-ggsave(
-  "outputs/figures/across_region_its2_2024_clade_d_vs_experimental_prop_d.png",
-  width = 8,
-  height = 5,
   dpi = 300
 )
 ```
