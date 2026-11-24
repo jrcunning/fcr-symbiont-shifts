@@ -201,6 +201,151 @@ plot_sample_count_heatmap(
 )
 ```
 
+## Distribution of the retained sample set
+
+These summaries use the samples retained after species-group filtering, before
+composition standardization. Zeroes indicate combinations with no retained
+samples; species use the same order in both regions.
+
+```{r retained-sample-distribution, fig.width=11, fig.height=7}
+retained_distribution <- sample_summary_retained |>
+  mutate(era = as.character(era)) |>
+  tidyr::complete(collection_subregion, host_species_code, era = eras,
+                  fill = list(n = 0))
+
+retained_total <- sum(retained_distribution$n)
+region_totals <- retained_distribution |>
+  group_by(collection_subregion) |>
+  summarize(n = sum(n), .groups = "drop")
+region_labels <- setNames(
+  paste0(region_totals$collection_subregion, " (n = ", region_totals$n, ")"),
+  region_totals$collection_subregion
+)
+species_order <- retained_distribution |>
+  group_by(host_species_code) |>
+  summarize(n = sum(n), .groups = "drop") |>
+  arrange(n, host_species_code) |>
+  pull(host_species_code)
+retained_distribution <- retained_distribution |>
+  mutate(era = factor(era, levels = eras),
+         host_species_code = factor(host_species_code, levels = species_order))
+
+era_colors <- c("2001-03" = "#4C78A8", "2019-21" = "#E9A23B", "2024" = "#319984")
+distribution_theme <- theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom")
+distribution_subtitle <- paste0(
+  "", retained_total, " retained samples after species-group filtering"
+)
+
+retained_count_heatmap <- plot_sample_count_heatmap(
+  retained_distribution,
+  title = "Retained samples by species and era",
+  subtitle = distribution_subtitle
+) + facet_wrap(~ collection_subregion, nrow = 1,
+               labeller = as_labeller(region_labels))
+retained_count_heatmap
+
+retained_species_plot <- ggplot(
+  retained_distribution, aes(x = n, y = host_species_code, fill = era)
+) +
+  geom_col(width = 0.75) +
+  geom_text(aes(label = if_else(n > 0, as.character(n), "")),
+            position = position_stack(vjust = 0.5), size = 3) +
+  facet_wrap(~ collection_subregion, nrow = 1,
+             labeller = as_labeller(region_labels)) +
+  scale_fill_manual(values = era_colors, drop = FALSE) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "Retained samples by species", subtitle = distribution_subtitle,
+       x = "Number of samples", y = "Host species", fill = "Era") +
+  distribution_theme
+retained_species_plot
+
+retained_era_counts <- retained_distribution |>
+  group_by(collection_subregion, era) |>
+  summarize(n = sum(n), .groups = "drop")
+retained_era_plot <- ggplot(retained_era_counts, aes(x = era, y = n, fill = era)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = n), vjust = -0.5, size = 4) +
+  facet_wrap(~ collection_subregion, nrow = 1,
+             labeller = as_labeller(region_labels)) +
+  scale_fill_manual(values = era_colors, drop = FALSE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Retained samples by era", subtitle = distribution_subtitle,
+       x = NULL, y = "Number of samples") +
+  distribution_theme + theme(legend.position = "none")
+retained_era_plot
+
+readr::write_csv(retained_distribution,
+                 "outputs/tables/retained_sample_counts_by_region_species_era.csv")
+readr::write_csv(retained_era_counts,
+                 "outputs/tables/retained_sample_counts_by_region_era.csv")
+for (extension in c("png", "pdf")) {
+  for (plot_name in c("retained_count_heatmap", "retained_species_plot", "retained_era_plot")) {
+    ggsave(file.path("outputs/figures", paste0(plot_name, ".", extension)),
+           plot = get(plot_name), width = 11,
+           height = if (plot_name == "retained_era_plot") 4.5 else 7, dpi = 300)
+  }
+}
+```
+
+## Mirrored retained samples with species icons
+
+DRTO extends left and Upper Keys extends right on the same count scale.
+The icon mapping was supplied by the user; the original PNGs belong in
+`data/assets/species_icons/`.
+
+```{r retained-samples-mirrored, fig.width=12, fig.height=5, dev.args=list(bg="transparent")}
+source("R/plot_retained_samples_mirrored.R")
+icon_manifest <- readr::read_csv(
+  "data/assets/species_icons/species_icon_mapping.csv", show_col_types = FALSE)
+if (all(file.exists(file.path("data/assets/species_icons", icon_manifest$filename)))) {
+  retained_species_mirrored <- plot_retained_samples_mirrored(
+    retained_distribution, era_colors)
+  print(retained_species_mirrored)
+  for (extension in c("png", "pdf")) {
+    ggsave(paste0("outputs/figures/retained_species_mirrored.", extension),
+           retained_species_mirrored, width = 12, height = 5, dpi = 300,
+           bg = "transparent")
+  }
+} else {
+  cat("Mirrored icon figure awaits PNGs in data/assets/species_icons/.")
+}
+```
+
+## Retained sample grids
+
+Circle area is proportional to sample count; in the waffle version each square
+represents one sample. The simpler alternatives use monochrome counts or solid bars with a common
+count scale. All versions use the same species order; shape-based versions
+retain era colors, while the count table uses white text for dark slides.
+
+```{r retained-sample-grids, fig.width=12, fig.height=6, dev.args=list(bg="transparent")}
+if (all(file.exists(file.path("data/assets/species_icons", icon_manifest$filename)))) {
+  source("R/figure_fonts.R")
+  source("R/plot_retained_samples_grid.R")
+  for (grid_style in c("circles", "waffle", "numbers", "bars")) {
+    sample_grid <- plot_retained_samples_grid(retained_distribution, era_colors, grid_style)
+    print(sample_grid)
+    if (grid_style == "waffle") {
+      sample_grid_black <- plot_retained_samples_grid(
+        retained_distribution, era_colors, grid_style, text_color = "black")
+      for (extension in c("png", "pdf")) {
+        save_aptos_figure(paste0("outputs/figures/retained_species_grid_waffle_black_text.", extension),
+               sample_grid_black, width = 12, height = 6, dpi = 300, bg = "transparent")
+      }
+    }
+    for (extension in c("png", "pdf")) {
+      save_aptos_figure(paste0("outputs/figures/retained_species_grid_", grid_style, ".", extension),
+             sample_grid, width = 12, height = if (grid_style == "numbers") 5.2 else 6,
+             dpi = 300, bg = "transparent")
+    }
+  }
+}
+```
+
 ## Harmonize collection site names
 
 Create a harmonized site-name variable before site-level diagnostics. Current
@@ -554,6 +699,70 @@ permanova_results |>
   knitr::kable(escape = FALSE)
 ```
 
+## Do recent shifts differ between regions?
+
+The separate era tests above do not test whether temporal trajectories differ
+between regions. A supplementary analysis tests the region-by-era interaction
+for species with at least two retained samples in each region and era in
+2019–21 and 2024. Only CNAT, DLAB, OFAV, and PSTR meet that requirement.
+
+Run `Rscript code/test_region_era_interactions.R` from the project root to
+regenerate this analysis (seed 20261123; 9,999 permutations per model).
+The primary Bray–Curtis PERMANOVA is:
+
+`composition ~ region:era + Condition(site_id + depth_upper + era)`
+
+`site_id` combines region and harmonized site; these fixed effects absorb the
+region main effect. `depth_upper` uses up to six quantile depth bins for Upper
+Keys, with a single unmodeled-depth level for Dry Tortugas. Dry Tortugas depth
+cannot be adjusted because all 2019–21 records lack depth. The interaction adds
+one estimable degree of freedom beyond the common era effect and nuisance terms.
+The partial distance-based interaction test removes the site, Upper Keys depth,
+and common era effects before residual permutations restricted within
+region-specific sites. This is a partial Bray–Curtis PERMANOVA, implemented with
+`vegan::dbrda()` and `anova(..., model = "reduced")`. Benjamini–Hochberg adjustment is applied across the four
+species, separately for each model variant.
+
+Sensitivity analyses omit depth, restrict observations to sites sampled in both
+eras, or use Euclidean distances on `sqrt(proportion) / sqrt(2)` (the normalized
+Hellinger metric). A four-group region-by-era dispersion screen is also reported;
+it is a diagnostic, not a separate test of the interaction. Nonsignificant
+interactions do not establish equivalence of regional trajectories.
+
+```{r region-era-interactions}
+region_interaction_path <- "outputs/tables/region_era_interaction_tests.csv"
+if (file.exists(region_interaction_path)) {
+  region_interaction_tests <- readr::read_csv(region_interaction_path, show_col_types = FALSE)
+  region_interaction_tests |>
+    filter(variant == "primary_bray") |>
+    select(host_species_code, n, n_shared_sites, interaction_r2, pseudo_f, p, p_bh) |>
+    knitr::kable(digits = 4, caption = "Regional differences in 2019–21 to 2024 trajectories: primary interaction tests")
+
+  region_interaction_tests |>
+    select(host_species_code, variant, n, interaction_r2, p, p_bh) |>
+    knitr::kable(digits = 4, caption = "Sensitivity of region-by-era interaction tests")
+
+  readr::read_csv("outputs/tables/region_era_dispersion_tests.csv", show_col_types = FALSE) |>
+    knitr::kable(digits = 4, caption = "Region-by-era dispersion diagnostic")
+}
+```
+
+The primary interaction analysis detects a regional difference for OFAV
+(*O. faveolata*; unadjusted p = 0.0079, BH-adjusted p = 0.0316). The interaction
+accounts for 2.28% of total Bray–Curtis variation (partial R² = 0.0458). CNAT,
+DLAB, and PSTR have no detected interaction after correction; this does not
+establish equivalence. These tests concern 2019–21 to 2024 only, because Dry
+Tortugas has no retained 2001–03 samples. A blanket statement that shifts did
+not differ between regions is therefore unsupported. Inspect the sensitivity
+and dispersion tables above before interpreting the regional difference.
+OFAV remains significant after BH correction in all sensitivity analyses
+(site-only p = 0.0280; shared sites p = 0.0128; Hellinger p = 0.0140).
+The four region-by-era groups also have heterogeneous dispersion for OFAV
+(BH-adjusted p = 0.0002), CNAT, and PSTR. PERMANOVA can conflate centroid and
+dispersion differences, so the OFAV interaction should not be described as a
+pure mean-shift test. The Bray–Curtis dispersion calculation also required
+vegan's usual truncation of some negative squared distances to zero.
+
 ## Site/depth-standardized composition shifts
 
 Summarize pairwise era shifts using Hellinger distances calculated from the
@@ -853,6 +1062,19 @@ genus_labels <- c(
 
 sample_level_metric_cols <- c(
   paste0("dominant_", clades),
+  "symbiodinium_ge_10",
+  "symbiodinium_ge_50",
+  "symbiodinium_ge_75",
+  "symbiodinium_ge_90",
+  "breviolum_ge_10",
+  "breviolum_ge_50",
+  "breviolum_ge_75",
+  "breviolum_ge_90",
+  "cladocopium_ge_10",
+  "cladocopium_ge_50",
+  "cladocopium_ge_75",
+  "cladocopium_ge_90",
+  "durusdinium_ge_10",
   "durusdinium_ge_50",
   "durusdinium_ge_75",
   "durusdinium_ge_90"
@@ -869,6 +1091,19 @@ field_observed_sample_metrics <- sample_clades_retained |>
     dominant_C = as.numeric(dominant_clade == "C"),
     dominant_D = as.numeric(dominant_clade == "D"),
     dominant_G = as.numeric(dominant_clade == "G"),
+    symbiodinium_ge_10 = as.numeric(A >= 0.10),
+    symbiodinium_ge_50 = as.numeric(A >= 0.50),
+    symbiodinium_ge_75 = as.numeric(A >= 0.75),
+    symbiodinium_ge_90 = as.numeric(A >= 0.90),
+    breviolum_ge_10 = as.numeric(B >= 0.10),
+    breviolum_ge_50 = as.numeric(B >= 0.50),
+    breviolum_ge_75 = as.numeric(B >= 0.75),
+    breviolum_ge_90 = as.numeric(B >= 0.90),
+    cladocopium_ge_10 = as.numeric(C >= 0.10),
+    cladocopium_ge_50 = as.numeric(C >= 0.50),
+    cladocopium_ge_75 = as.numeric(C >= 0.75),
+    cladocopium_ge_90 = as.numeric(C >= 0.90),
+    durusdinium_ge_10 = as.numeric(D >= 0.10),
     durusdinium_ge_50 = as.numeric(D >= 0.50),
     durusdinium_ge_75 = as.numeric(D >= 0.75),
     durusdinium_ge_90 = as.numeric(D >= 0.90)
@@ -1083,85 +1318,157 @@ ggsave("outputs/figures/field_observed_dominant_genus_by_species_era.png", domin
 ```
 
 ```{r field-observed-durusdinium-sample-threshold-plot}
-durusdinium_threshold_plot_data <- sample_metric_across_region |>
-  filter(
-    host_species_code %in% sample_level_plot_species,
-    era %in% c("2019-21", "2024")
-  ) |>
-  select(
-    host_species_code, era, n_total,
-    `Durusdinium-dominant\n(>=50%)` = durusdinium_ge_50,
-    `Strongly Durusdinium\n(>=75%)` = durusdinium_ge_75,
-    `Nearly fixed\n(>=90%)` = durusdinium_ge_90
-  ) |>
-  pivot_longer(
-    cols = contains("Durusdinium") | contains("fixed"),
-    names_to = "threshold",
-    values_to = "prevalence"
-  ) |>
-  mutate(
-    prevalence_count = prevalence * n_total,
-    prevalence_adjusted = (prevalence_count + 0.5) / (n_total + 1),
-    prevalence_se = sqrt(prevalence_adjusted * (1 - prevalence_adjusted) / (n_total + 1)),
-    prevalence_lower = pmax(0, prevalence - prevalence_se),
-    prevalence_upper = pmin(1, prevalence + prevalence_se)
+make_sample_threshold_plot <- function(genus_slug, genus_name) {
+  threshold_cols <- paste0(genus_slug, "_ge_", c("10", "50", "90"))
+  threshold_levels <- c(">=10%", ">=50%", ">=90%")
+  threshold_labels <- set_names(threshold_levels, threshold_cols)
+  threshold_widths <- c(">=10%" = 1.35, ">=50%" = 3.10, ">=90%" = 5.80)
+  era_colors <- c("2019-21" = "#4E79A7", "2024" = "#B65A48")
+
+  plot_data <- sample_metric_across_region |>
+    filter(
+      host_species_code %in% sample_level_plot_species,
+      era %in% c("2019-21", "2024")
+    ) |>
+    select(host_species_code, era, n_total, all_of(threshold_cols)) |>
+    pivot_longer(
+      cols = all_of(threshold_cols),
+      names_to = "threshold_metric",
+      values_to = "prevalence"
+    ) |>
+    mutate(
+      threshold = recode(threshold_metric, !!!threshold_labels),
+      threshold = factor(threshold, levels = threshold_levels),
+      prevalence = pmin(1, pmax(0, prevalence)),
+      prevalence_count = prevalence * n_total,
+      prevalence_adjusted = (prevalence_count + 0.5) / (n_total + 1),
+      prevalence_se = sqrt(prevalence_adjusted * (1 - prevalence_adjusted) / (n_total + 1)),
+      prevalence_lower = pmax(0, prevalence - prevalence_se),
+      prevalence_upper = pmin(1, prevalence + prevalence_se),
+      era = factor(era, levels = c("2019-21", "2024"))
+    ) |>
+    filter(!is.na(prevalence))
+
+  species_order <- plot_data |>
+    filter(era == "2024", threshold == ">=50%") |>
+    arrange(prevalence) |>
+    pull(host_species_code) |>
+    unique()
+
+  species_order <- c(
+    species_order,
+    setdiff(sort(unique(plot_data$host_species_code)), species_order)
   )
 
-durusdinium_threshold_species_order <- durusdinium_threshold_plot_data |>
-  filter(era == "2024", threshold == "Durusdinium-dominant\n(>=50%)") |>
-  arrange(prevalence) |>
-  pull(host_species_code) |>
-  unique()
+  plot_data <- plot_data |>
+    mutate(
+      host_species_code = factor(host_species_code, levels = species_order),
+      species_y = as.numeric(host_species_code),
+      threshold_draw = factor(threshold, levels = rev(threshold_levels))
+    )
 
-durusdinium_threshold_species_order <- c(
-  durusdinium_threshold_species_order,
-  setdiff(sort(unique(durusdinium_threshold_plot_data$host_species_code)), durusdinium_threshold_species_order)
-)
+  threshold_connectors <- plot_data |>
+    select(host_species_code, threshold, species_y, era, prevalence) |>
+    pivot_wider(names_from = era, values_from = prevalence) |>
+    filter(!is.na(`2019-21`), !is.na(`2024`))
 
-durusdinium_threshold_plot <- durusdinium_threshold_plot_data |>
-  mutate(
-    host_species_code = factor(host_species_code, levels = durusdinium_threshold_species_order),
-    era = factor(era, levels = c("2019-21", "2024"))
-  ) |>
-  ggplot(aes(x = prevalence, y = host_species_code)) +
-  geom_line(aes(group = host_species_code), color = "grey70", linewidth = 0.5) +
-  geom_segment(
-    aes(
-      x = prevalence_lower,
-      xend = prevalence_upper,
-      yend = host_species_code,
-      color = era
-    ),
-    linewidth = 4.5,
-    alpha = 0.22,
-    lineend = "round"
-  ) +
-  geom_point(aes(color = era), size = 2.5, alpha = 0.9) +
-  facet_wrap(~ threshold, nrow = 1) +
-  scale_x_continuous(
-    labels = scales::percent_format(accuracy = 1),
-    limits = c(0, 1),
-    expand = expansion(mult = c(0.01, 0.03))
-  ) +
-  scale_color_manual(values = c("2019-21" = "#3B6EA8", "2024" = "#C7533F")) +
-  labs(
-    x = "Standardized fraction of samples",
-    y = "Host species",
-    color = "Era",
-    title = "Durusdinium prevalence thresholds by species",
-    subtitle = "Each point is the fraction of samples meeting a within-sample Durusdinium threshold"
-  ) +
-  theme_classic() +
-  theme(
-    plot.title = element_text(face = "bold"),
-    strip.background = element_blank(),
-    strip.text = element_text(face = "bold"),
-    legend.position = "bottom"
-  )
+  plot_data_ordered <- plot_data |>
+    arrange(threshold_draw)
+
+  ggplot(plot_data, aes(x = prevalence, y = species_y)) +
+    geom_segment(
+      data = threshold_connectors,
+      aes(x = `2019-21`, xend = `2024`, y = species_y, yend = species_y),
+      inherit.aes = FALSE,
+      color = "grey82",
+      alpha = 0.18,
+      linewidth = 0.38,
+      lineend = "round"
+    ) +
+    geom_segment(
+      data = plot_data_ordered,
+      aes(
+        x = prevalence_lower,
+        xend = prevalence_upper,
+        y = species_y,
+        yend = species_y,
+        linewidth = threshold,
+        color = era
+      ),
+      alpha = 0.20,
+      lineend = "round"
+    ) +
+    geom_point(
+      data = plot_data_ordered,
+      aes(size = threshold, color = era),
+      shape = 16,
+      alpha = 0.48
+    ) +
+    scale_linewidth_manual(
+      values = threshold_widths,
+      name = "Threshold"
+    ) +
+    scale_size_manual(
+      values = threshold_widths,
+      name = "Threshold"
+    ) +
+    scale_x_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      limits = c(0, 1),
+      breaks = seq(0, 1, 0.25),
+      oob = scales::squish,
+      expand = expansion(mult = c(0.01, 0.04))
+    ) +
+    scale_y_continuous(
+      breaks = seq_along(species_order),
+      labels = species_order,
+      expand = expansion(add = 0.65)
+    ) +
+    scale_color_manual(values = era_colors, name = "Era") +
+    guides(
+      linewidth = "none",
+      size = guide_legend(
+        order = 1,
+        override.aes = list(shape = 16, color = "grey55", alpha = 0.55)
+      ),
+      color = guide_legend(
+        order = 2,
+        override.aes = list(size = 4, alpha = 0.48)
+      )
+    ) +
+    labs(
+      x = "Standardized fraction of colonies",
+      y = "Host species",
+      title = paste(genus_name, "prevalence thresholds by species"),
+      subtitle = paste(
+        "Point and bar size encode within-sample",
+        genus_name,
+        "thresholds: >=10%, >=50%, and >=90%"
+      )
+    ) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom",
+      axis.ticks.y = element_blank(),
+      panel.grid.major.x = element_line(color = "grey90", linewidth = 0.25)
+    )
+}
+
+durusdinium_threshold_plot <- make_sample_threshold_plot("durusdinium", "Durusdinium")
+symbiodinium_threshold_plot <- make_sample_threshold_plot("symbiodinium", "Symbiodinium")
+breviolum_threshold_plot <- make_sample_threshold_plot("breviolum", "Breviolum")
+cladocopium_threshold_plot <- make_sample_threshold_plot("cladocopium", "Cladocopium")
 
 durusdinium_threshold_plot
+symbiodinium_threshold_plot
+breviolum_threshold_plot
+cladocopium_threshold_plot
 
-ggsave("outputs/figures/field_observed_durusdinium_sample_thresholds_by_species.png", durusdinium_threshold_plot, width = 13, height = 6.5, dpi = 300)
+ggsave("outputs/figures/field_observed_durusdinium_sample_thresholds_by_species.png", durusdinium_threshold_plot, width = 9.4, height = 5.8, dpi = 300)
+ggsave("outputs/figures/field_observed_symbiodinium_sample_thresholds_by_species.png", symbiodinium_threshold_plot, width = 9.4, height = 5.8, dpi = 300)
+ggsave("outputs/figures/field_observed_breviolum_sample_thresholds_by_species.png", breviolum_threshold_plot, width = 9.4, height = 5.8, dpi = 300)
+ggsave("outputs/figures/field_observed_cladocopium_sample_thresholds_by_species.png", cladocopium_threshold_plot, width = 9.4, height = 5.8, dpi = 300)
 ```
 
 # Field shifts versus experimental shuffling
@@ -1998,6 +2305,14 @@ not by depth because depth data are incomplete.
 Regions are weighted equally when both regions are available for a species and
 era. This is intended as an across-region biological synthesis rather than a
 sample-size-weighted summary dominated by the region with more samples.
+
+The combined presentation is a synthesis, not a claim of regional equivalence.
+OFAV has a significant region-by-era interaction for 2019–21 to 2024, despite
+similar 2024 Durusdinium dominance in both regions. The standardized Durusdinium
+increase is about 70 percentage points in Dry Tortugas versus 35 in Upper Keys.
+Regional coverage varies among eras; 2001–03 includes Upper Keys only.
+The slide-ready combined view can be regenerated with
+`Rscript code/create_composition_overview_slide.R`.
 
 ```{r across-region-composition}
 across_region_composition |>
