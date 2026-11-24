@@ -225,6 +225,40 @@ sample_clades_retained <- sample_clades |>
   )
 ```
 
+## Export retained sample metadata
+
+Export one row per retained sample, including all fields from the source
+metadata and the derived era, species code, numeric coordinates and depth,
+harmonized site name, and post-MED read count. Missing values are written as
+`NA`; collection dates retain the source `YYYYMMDD` format.
+
+```{r export-retained-sample-metadata}
+if (anyDuplicated(metadata$sample_name) || anyDuplicated(sample_clades_retained$sample_name)) {
+  stop("Sample names must be unique before exporting retained sample metadata.")
+}
+
+retained_sample_metadata <- metadata |>
+  semi_join(sample_clades_retained |> select(sample_name), by = "sample_name") |>
+  left_join(
+    sample_clades_retained |>
+      select(sample_name, collection_site_harmonized, post_med_reads),
+    by = "sample_name"
+  ) |>
+  select(
+    sample_name, host_genus, host_species, host_species_code,
+    collection_region, collection_subregion, collection_site,
+    collection_site_harmonized, collection_date, year, era,
+    latitude, longitude, depth_ft, post_med_reads, everything()
+  ) |>
+  arrange(collection_subregion, collection_site_harmonized, era, sample_name)
+
+if (nrow(retained_sample_metadata) != nrow(sample_clades_retained)) {
+  stop("Retained sample metadata does not match the analysis sample set.")
+}
+
+readr::write_csv(retained_sample_metadata, "data/processed/retained_sample_metadata.csv")
+```
+
 ## Summarize retained sites
 
 Break the filtered samples down by harmonized collection site, host species,
@@ -313,6 +347,90 @@ plot_site_species_heatmap <- function(summary_df, subregion) {
 
 plot_site_species_heatmap(site_species_summary, "Dry Tortugas")
 plot_site_species_heatmap(site_species_summary, "Upper Keys")
+```
+
+## Map retained sampling locations
+
+Each point represents a distinct recorded coordinate among samples retained
+after species-group filtering; overlapping samples share a point. The map extent
+is an estimate based on the reference image, which did not contain geographic
+coordinates. It assumes a north-up Web Mercator projection, so alignment with
+the original background may require adjustment. The transparent PNG has the
+same pixel dimensions and extent as the reference image and can be placed over
+an image with the same crop and projection.
+
+```{r retained-sampling-map, fig.width=10, fig.height=4.83}
+# Approximate reference-image bounds inferred from the visible sampling markers.
+# Define the vertical extent from the image aspect ratio in projected space.
+reference_width_px <- 6673
+reference_height_px <- 3222
+reference_lon_limits <- c(-83.57016, -79.56436)
+reference_top_latitude <- 26.10897
+mercator_radius <- 6378137
+map_x_limits <- mercator_radius * reference_lon_limits * pi / 180
+map_y_top <- mercator_radius * log(tan(pi / 4 + reference_top_latitude * pi / 360))
+map_y_limits <- c(
+  map_y_top - diff(map_x_limits) * reference_height_px / reference_width_px,
+  map_y_top
+)
+
+map_samples <- sample_clades_retained |>
+  mutate(
+    valid_coordinates = is.finite(longitude) & is.finite(latitude) &
+      between(longitude, -180, 180) & between(latitude, -85.0511, 85.0511),
+    map_x = if_else(valid_coordinates, mercator_radius * longitude * pi / 180, NA_real_),
+    map_y = if_else(valid_coordinates,
+      mercator_radius * log(tan(pi / 4 + latitude * pi / 360)), NA_real_),
+    in_map_extent = valid_coordinates & between(map_x, map_x_limits[1], map_x_limits[2]) &
+      between(map_y, map_y_limits[1], map_y_limits[2])
+  )
+
+map_samples |>
+  summarize(
+    retained_samples = n(),
+    missing_or_invalid_coordinates = sum(!valid_coordinates),
+    outside_estimated_extent = sum(valid_coordinates & !in_map_extent),
+    plotted_samples = sum(in_map_extent),
+    distinct_plotted_coordinates = n_distinct(paste(longitude[in_map_extent], latitude[in_map_extent]))
+  ) |>
+  knitr::kable(caption = "Coverage of retained samples in the sampling location map")
+
+map_locations <- map_samples |>
+  filter(in_map_extent) |>
+  distinct(longitude, latitude) |>
+  sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326) |>
+  sf::st_transform(3857)
+
+florida_outline <- rnaturalearth::ne_states(
+  country = "united states of america", returnclass = "sf"
+) |>
+  filter(name == "Florida") |>
+  sf::st_transform(3857)
+
+map_coordinates <- coord_sf(
+  crs = sf::st_crs(3857), xlim = map_x_limits, ylim = map_y_limits,
+  expand = FALSE, datum = NA
+)
+map_theme <- theme_void() + theme(
+  plot.margin = margin(0, 0, 0, 0),
+  panel.background = element_rect(fill = "transparent", color = NA),
+  plot.background = element_rect(fill = "transparent", color = NA)
+)
+map_points <- geom_sf(data = map_locations, shape = 21, fill = "red",
+                      color = "black", size = 2.2, stroke = 0.35)
+
+sampling_map <- ggplot() +
+  geom_sf(data = florida_outline, fill = "grey90", color = "grey40", linewidth = 0.3) +
+  map_points + map_coordinates + map_theme
+sampling_map
+
+sampling_points_overlay <- ggplot() + map_points + map_coordinates + map_theme
+ggsave(
+  "outputs/figures/retained_sampling_locations_overlay.png",
+  sampling_points_overlay,
+  width = reference_width_px, height = reference_height_px, units = "px",
+  dpi = 500, bg = "transparent"
+)
 ```
 
 # Sampling depth diagnostics
