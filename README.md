@@ -26,3 +26,18 @@ Copy these files into the project before knitting `code/analysis.Rmd`:
 
 The old Rmd also referenced type-profile tables, but the cleaned analysis does
 not need them for the main clade-composition shift question.
+
+Knitting the main analysis exports `data/processed/retained_sample_metadata.csv`
+with one row for each sample retained after the subregion-by-species filter.
+It includes all source metadata fields, derived host species codes and eras,
+numeric latitude and longitude (decimal degrees), depth in feet, harmonized site
+name, and post-MED read count. Collection dates use the source `YYYYMMDD`
+format, and missing values are written as `NA`. Symbiont composition is not
+included in this metadata export.
+
+The retained sampling-location map also uses the R packages `sf`,
+`rnaturalearth`, and `rnaturalearthhires` for the Florida outline. Knitting the
+analysis writes a transparent, points-only overlay to
+`outputs/figures/retained_sampling_locations_overlay.png`. Its extent is an
+estimate of the reference image crop in Web Mercator; it may need adjustment to
+align with a background whose exact extent or projection differs.
